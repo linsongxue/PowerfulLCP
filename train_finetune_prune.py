@@ -446,8 +446,7 @@ def channels_select(cfg, data, origin_model, pruning_model, aux_util, device, da
 
 
 def get_thin_model(cfg, data, weights, img_size, batch_size, accumulate, prune_rate, aux_epochs=10, ft_epochs=5,
-                   resume=False,
-                   cache_images=False):
+                   resume=False, cache_images=False):
     init_seeds()
 
     # -----------------dataset-----------------
