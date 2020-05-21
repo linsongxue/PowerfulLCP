@@ -558,7 +558,7 @@ if __name__ == '__main__':
     parser.add_argument('--accumulate', type=int, default=2, help='batches to accumulate before optimizing')
     parser.add_argument('--cfg', type=str, default='cfg/yolov3.cfg', help='*.cfg path')
     parser.add_argument('--weights', type=str, default='../weights/converted.pt', help='initial weights')
-    parser.add_argument('--data', type=str, default='data/voc.data', help='*.data path')
+    parser.add_argument('--data', type=str, default='data/coco2014.data', help='*.data path')
     parser.add_argument('--img-size', type=int, default=416, help='inference size (pixels)')
     parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1 or cpu)')
     parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')

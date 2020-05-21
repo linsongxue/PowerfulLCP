@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch
 import torch.distributed as dist
 from models import Darknet
-from utils.utils import wh_iou
+from utils.utils import wh_iou, bbox_iou
 import torch.optim as optim
 from tqdm import tqdm
 import torch.optim.lr_scheduler as lr_scheduler
@@ -247,11 +247,13 @@ class AuxNetUtils(object):
                 in_channels = self.layer_info[int(layer)]["in_channels"]
                 aux_net = AuxNet(in_channels, self.num_classes, self.anchors, img_size, feature_maps_size).to(device)
                 aux_net.hyp = self.hyp
+                aux_net.nc = self.num_classes
                 self.aux_list.append(aux_net)
         else:
             in_channels = self.layer_info[conv_layer_name]["in_channels"]
             aux_net = AuxNet(in_channels, self.num_classes, self.anchors, img_size, feature_maps_size).to(device)
             aux_net.hyp = self.hyp
+            aux_net.nc = self.num_classes
 
             return aux_net
 
@@ -383,20 +385,29 @@ class AuxNetUtils(object):
             aux_model = aux_model.module  # aux 的超参数是模型内自带的，所以需要脱分布式训练的壳
         hyp = aux_model.hyp
         ft = torch.cuda.FloatTensor if output.is_cuda else torch.Tensor
-        BCEcls = nn.BCEWithLogitsLoss(pos_weight=ft([hyp['cls_pw']]))
+        BCEcls = nn.BCEWithLogitsLoss(pos_weight=ft([hyp['cls_pw']]), reduction='sum')
         txy, twh, tcls, tbox, index, anchors_vec = AuxNetUtils.build_targets_for_aux(aux_model, targets)
         b, a, j, i = index
-        pn = output[b, a, j, i]  # predict needed
-        pxy = torch.sigmoid(pn[:, 0:2])
-        pbox = torch.cat([pxy, torch.exp(pn[:, 2:4]).clamp(max=1E3) * anchors_vec], dim=1)
-        DIoU = AuxNetUtils.bbox_iou(pbox, tbox, x1y1x2y2=False, DIoU=True)
+        nb = len(b)
+        if nb:
+            pn = output[b, a, j, i]  # predict needed
+            pxy = torch.sigmoid(pn[:, 0:2])
+            pbox = torch.cat([pxy, torch.exp(pn[:, 2:4]).clamp(max=1E3) * anchors_vec], dim=1)
+            DIoU = bbox_iou(pbox.t(), tbox, x1y1x2y2=False, DIoU=True)
 
-        lbox += hyp['diou'] * (1 - DIoU).sum()
+            lbox += (1 - DIoU).sum()
 
-        tclsm = torch.zeros_like(pn[:, 4:])
-        tclsm[range(len(b)), tcls] = 1.0
+            tclsm = torch.zeros_like(pn[:, 4:])
+            tclsm[range(len(b)), tcls] = 1.0
 
-        lcls += hyp['cls'] * BCEcls(pn[:, 4:], tclsm)
+            lcls += BCEcls(pn[:, 4:], tclsm)
+
+        lbox *= hyp['diou']
+        lcls *= hyp['cls']
+
+        if nb:
+            lbox /= nb
+            lcls /= (nb * aux_model.nc)
 
         loss = lbox + lcls
 
