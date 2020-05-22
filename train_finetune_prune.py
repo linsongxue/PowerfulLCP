@@ -157,6 +157,7 @@ def fine_tune(cfg, data, pruned_model, aux_util, device, train_loader, test_load
         print(('\n' + '%10s' * 8) % ('Stage', 'Epoch', 'gpu_mem', 'DIoU', 'obj', 'cls', 'total', 'targets'))
 
         # -------------start batch-------------
+        mloss = torch.zeros(4).to(device)
         pbar = tqdm(enumerate(train_loader), total=nb)
         for i, (img, targets, _, _) in pbar:
             if len(targets) == 0:
@@ -177,11 +178,11 @@ def fine_tune(cfg, data, pruned_model, aux_util, device, train_loader, test_load
 
             if mixed_precision:
                 with amp.scale_loss(pruned_loss, pruned_optimizer) as pruned_scaled_loss:
-                    pruned_scaled_loss.backward()
+                    pruned_scaled_loss.backward(retain_graph=True)
                 with amp.scale_loss(aux_loss, aux_optimizer) as aux_scaled_loss:
                     aux_scaled_loss.backward()
             else:
-                pruned_loss.backward()
+                pruned_loss.backward(retain_graph=True)
                 aux_loss.backward()
 
             aux_util.clean_hook_out()
@@ -194,9 +195,11 @@ def fine_tune(cfg, data, pruned_model, aux_util, device, train_loader, test_load
             pruned_loss_items[0] += aux_loss_items[0]
             pruned_loss_items[2] += aux_loss_items[1]
             pruned_loss_items[3] += aux_loss_items[2]
+            pruned_loss_items /= 2
+            mloss = (mloss * i + pruned_loss_items) / (i + 1)
             mem = torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0
             s = ('%10s' * 3 + '%10.3g' * 5) % (
-                'Fine tune', '%g/%g' % (epoch, epochs - 1), '%.3gG' % mem, *pruned_loss_items, len(targets))
+                'Fine tune', '%g/%g' % (epoch, epochs - 1), '%.3gG' % mem, *mloss, len(targets))
             pbar.set_description(s)
         # -------------end batch-------------
 
@@ -214,9 +217,6 @@ def fine_tune(cfg, data, pruned_model, aux_util, device, train_loader, test_load
                                save_json=False,
                                dataloader=test_loader)
 
-        with open(progress_result, 'a') as f:
-            f.write(('%10s' * 3 + '%10.3g' * 7) % ('Fine tune', '%g/%g' % (epoch, epochs - 1), results) + '\n')
-
         chkpt = {'current_layer': current_layer_name,
                  'epoch': epoch,
                  'model': pruned_model.module if type(
@@ -228,9 +228,12 @@ def fine_tune(cfg, data, pruned_model, aux_util, device, train_loader, test_load
 
         chkpt_aux = torch.load(aux_weight, map_location=device)
         chkpt_aux['aux{}'.format(aux_idx)] = aux_net.module.state_dict() if type(
-                    aux_net) is nn.parallel.DistributedDataParallel else aux_net.state_dict()
+            aux_net) is nn.parallel.DistributedDataParallel else aux_net.state_dict()
         torch.save(chkpt_aux, aux_weight)
         del chkpt_aux
+
+        with open(progress_result, 'a') as f:
+            f.write(('%10s' * 2 + '%10.3g' * 7) % ('Fine tune', '%g/%g' % (epoch, epochs - 1), results) + '\n')
     # -------------end train-------------
     torch.cuda.empty_cache()
     dist.destroy_process_group() if torch.cuda.device_count() > 1 else None
@@ -374,6 +377,7 @@ def channels_select(cfg, data, origin_model, pruning_model, aux_util, device, da
     del pg1, pg0
 
     # ----------update weight----------
+    mloss = torch.zeros(4).to(device)
     pbar = tqdm(enumerate(data_loader), total=nb)
     for i, (imgs, targets, _, _) in pbar:
 
@@ -392,7 +396,7 @@ def channels_select(cfg, data, origin_model, pruning_model, aux_util, device, da
         aux_pred = aux_net(aux_util.hook_out['gpu0'][0])
         aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
 
-        mse_loss = 0.0
+        mse_loss = torch.zeros(1).to(device)
         for i in range(feature_num):
             mse_loss += (MSE(pruned_features[i], origin_features[i]) / feature_num)
 
@@ -405,8 +409,9 @@ def channels_select(cfg, data, origin_model, pruning_model, aux_util, device, da
             optimizer.zero_grad()
 
         mem = torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0
+        mloss = (mloss * i + torch.cat(mse_loss, pruning_loss, aux_loss, loss)) / (i + 1)
         s = ('%10s' * 2 + '%10.3g' * 5) % (
-            'Pruning', '%.3gG' % mem, mse_loss, pruning_loss, aux_loss, loss, len(targets))
+            'Pruning', '%.3gG' % mem, *mloss, len(targets))
         pbar.set_description(s)
 
         aux_util.clean_hook_out()

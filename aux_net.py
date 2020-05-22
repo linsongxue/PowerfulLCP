@@ -18,7 +18,7 @@ class HeadLayer(nn.Module):
         :param anchors: Numpy.array
         """
         super(HeadLayer, self).__init__()
-        self.anchors = torch.tensor(anchors)
+        self.anchors = torch.tensor(anchors, dtype=torch.float32)
         self.num_anchors = len(anchors)
         self.num_classes = num_classes
         self.num_feature = 4 + self.num_classes
@@ -43,8 +43,8 @@ class HeadLayer(nn.Module):
         stride = max(origin_img_size) / max(ng)
 
         self.anchors_vec = self.anchors / stride
-        self.anchors_vec = self.anchors_vec.to(device).type(dtype)
-        self.ng = torch.tensor(ng).to(device).type(dtype)
+        self.anchors_vec = self.anchors_vec.to(device)
+        self.ng = torch.tensor(ng).to(device)
 
 
 class AuxNet(nn.Module):
@@ -250,7 +250,9 @@ class AuxNetUtils(object):
                 aux_net.nc = self.num_classes
                 self.aux_list.append(aux_net)
         else:
-            in_channels = self.layer_info[conv_layer_name]["in_channels"]
+            aux_idx = self.conv_layer[conv_layer_name]
+            layer = self.down_sample_layer[aux_idx]
+            in_channels = self.layer_info[int(layer)]["in_channels"]
             aux_net = AuxNet(in_channels, self.num_classes, self.anchors, img_size, feature_maps_size).to(device)
             aux_net.hyp = self.hyp
             aux_net.nc = self.num_classes
