@@ -152,9 +152,8 @@ class AuxNetUtils(object):
         for i in range(torch.cuda.device_count()):
             self.hook_out['gpu{}'.format(i)] = []
         self.layer_info = []  # 元素是字典
-        self.short_cut_info = {}
         self.down_sample_layer = []  # 元素是str
-        self.conv_layer = []  # 最后会变成字典，key是conv层的名字，value是joint loss序号
+        self.conv_layer_dict = []  # 最后会变成字典，key是conv层的名字，value是joint loss序号
         self.pruning_layer = []  # 需要实行剪枝的层
         self.aux_list = []  # 元素是nn.Module
         self.analyze()
@@ -185,6 +184,7 @@ class AuxNetUtils(object):
                                 "kernel_size": module.kernel_size[0],
                                 "stride": module.stride[0],
                                 "padding": (module.kernel_size[0] - 1) // 2,
+                                "bias": False if module.bias is None else True,
                                 "shortcut": False}
 
         return analyse_dict
@@ -201,38 +201,23 @@ class AuxNetUtils(object):
                 info = AuxNetUtils.child_analyse(child)
                 self.layer_info.append(info)
                 if not info["shortcut"]:  # 记录非跨越层
-                    self.conv_layer.append(str(name))
+                    self.conv_layer_dict.append(str(name))
                     if info["stride"] == 2 or int(name) == last_darknet:  # 记录下采样层
                         self.down_sample_layer.append(str(name))
 
-        defs = self.model.module_defs
-        for idx, definition in enumerate(defs):
-            if idx <= last_darknet and definition['type'] == 'shortcut':
-                out = idx - 1
-                short = idx + int(definition['from'])
-                while self.model.module_defs[short]['type'] == "shortcut":
-                    short += int(self.model.module_defs[short]['from'])
-                if str(short) in self.short_cut_info:
-                    self.short_cut_info[str(short)].append(str(out))
-                else:
-                    self.short_cut_info[str(short)] = [str(out)]
-
         index = 0
         joint_loss_index = []
-        for layer in self.conv_layer:
+        for layer in self.conv_layer_dict:
             if int(layer) < int(self.down_sample_layer[index]):
                 joint_loss_index.append(index)
             else:
                 index += 1
                 joint_loss_index.append(index)
 
-        self.conv_layer = dict(zip(self.conv_layer, joint_loss_index))
-        self.conv_layer.pop(str(last_darknet))
-        for key, value in self.short_cut_info.items():
-            for layer in value:
-                self.conv_layer.pop(layer)
+        self.conv_layer_dict = dict(zip(self.conv_layer_dict, joint_loss_index))
+        self.conv_layer_dict.pop(str(last_darknet))
 
-        self.pruning_layer = list(self.conv_layer.keys())
+        self.pruning_layer = list(self.conv_layer_dict.keys())
 
     def creat_aux_list(self, img_size, device, feature_maps_size=52, conv_layer_name=None):
         """
@@ -250,7 +235,7 @@ class AuxNetUtils(object):
                 aux_net.nc = self.num_classes
                 self.aux_list.append(aux_net)
         else:
-            aux_idx = self.conv_layer[conv_layer_name]
+            aux_idx = self.conv_layer_dict[conv_layer_name]
             layer = self.down_sample_layer[aux_idx]
             in_channels = self.layer_info[int(layer)]["in_channels"]
             aux_net = AuxNet(in_channels, self.num_classes, self.anchors, img_size, feature_maps_size).to(device)
@@ -291,12 +276,6 @@ class AuxNetUtils(object):
             for device in device_list[1:]:
                 self.hook_out['gpu0'][i] = torch.cat([self.hook_out['gpu0'][i], self.hook_out[device][i].cuda(0)],
                                                      dim=0)
-
-    def next_conv_layer(self, current_layer_name):
-        if self.layer_info[int(current_layer_name) + 1]["shortcut"]:
-            return str(int(current_layer_name) + 2)
-        else:
-            return str(int(current_layer_name) + 1)
 
     def next_prune_layer(self, current_layer_name):
         index = self.pruning_layer.index(current_layer_name)

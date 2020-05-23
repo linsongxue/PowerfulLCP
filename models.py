@@ -57,22 +57,6 @@ def create_modules(module_defs, img_size, arc):
             if mdef['activation'] == 'leaky':  # TODO: activation study https://github.com/ultralytics/yolov3/issues/441
                 modules.add_module('activation', nn.LeakyReLU(0.1, inplace=True))
 
-        elif mdef['type'] == 'ghostcbamconv':
-            bn = int(mdef['batch_normalize'])
-            filters = int(mdef['filters'])
-            size = int(mdef['size'])
-            stride = int(mdef['stride']) if 'stride' in mdef else (int(mdef['stride_y']), int(mdef['stride_x']))
-            pad = (size - 1) // 2 if int(mdef['pad']) else 0
-            modules.add_module('GhostCBAM', GhostCBAM(in_channels=output_filters[-1],
-                                                      out_channels=filters,
-                                                      kernel_size=size,
-                                                      stride=stride,
-                                                      padding=pad,
-                                                      ghost_ratio=4,
-                                                      bn=bn))
-            if mdef['activation'] == 'leaky':  # TODO: activation study https://github.com/ultralytics/yolov3/issues/441
-                modules.add_module('activation', nn.LeakyReLU(0.1, inplace=True))
-
         elif mdef['type'] == 'maxpool':
             size = int(mdef['size'])
             stride = int(mdef['stride'])
@@ -264,7 +248,7 @@ class Darknet(nn.Module):
 
         for i, (mdef, module) in enumerate(zip(self.module_defs, self.module_list)):
             mtype = mdef['type']
-            if mtype in ['convolutional', 'upsample', 'maxpool', 'cbamconvolutional', 'ghostcbamconv']:
+            if mtype in ['convolutional', 'upsample', 'maxpool', 'cbamconvolutional', 'maskconvolutional']:
                 x = module(x)
             elif mtype == 'route':
                 layers = [int(x) for x in mdef['layers'].split(',')]
@@ -470,3 +454,9 @@ def attempt_download(weights):
         if not (r == 0 and os.path.exists(weights) and os.path.getsize(weights) > 1E6):  # weights exist and > 1MB
             os.system('rm ' + weights)  # remove partial downloads
             raise Exception(msg)
+
+class SSD(nn.Module):
+
+    def __init__(self, cfg, img_size=(300, 300)):
+        super(SSD, self).__init__()
+
