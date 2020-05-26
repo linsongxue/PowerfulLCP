@@ -237,7 +237,6 @@ def fine_tune(cfg, data, pruned_model, aux_util, device, train_loader, test_load
             f.write(('%10s' * 2 + '%10.3g' * 7) % ('Fine tune', '%g/%g' % (epoch, epochs - 1), *results) + '\n')
     # -------------end train-------------
     torch.cuda.empty_cache()
-    dist.destroy_process_group() if torch.cuda.device_count() > 1 else None
 
 
 def channels_select(cfg, data, origin_model, pruning_model, aux_util, device, data_loader, select_layer,
@@ -345,6 +344,13 @@ def channels_select(cfg, data, origin_model, pruning_model, aux_util, device, da
     new_module.add_module('activation', pruning_model.module_list[int(select_layer)].activation)
     new_module.MaskConv2d.selected_channels_mask[indices] = 1.0
     new_module.MaskBatchNorm2d.selected_channels_mask[indices] = 1.0
+
+    # parameters replace
+    new_module.MaskConv2d.weight.data = pruning_model.module_list[int(select_layer)].Conv2d.weight.data
+    new_module.MaskBatchNorm2d.weight.data = pruning_model.module_list[int(select_layer)].BatchNorm2d.weight.data
+    new_module.MaskBatchNorm2d.bias.data = pruning_model.module_list[int(select_layer)].BatchNorm2d.bias.data
+    new_module.MaskBatchNorm2d.running_mean = pruning_model.module_list[int(select_layer)].BatchNorm2d.running_mean
+    new_module.MaskBatchNorm2d.running_var = pruning_model.module_list[int(select_layer)].BatchNorm2d.running_var
     pg1 += [new_module.MaskConv2d.weight]
     pg0 += [new_module.MaskBatchNorm2d.weight, new_module.MaskBatchNorm2d.bias]
     pruning_model.module_list[int(select_layer)] = new_module
@@ -429,7 +435,7 @@ def channels_select(cfg, data, origin_model, pruning_model, aux_util, device, da
                            dataloader=None)
 
     with open(progress_result, 'a') as f:
-        f.write(('%10s' + '%10.3g' * 7) % ('Pruning ' + select_layer, results) + '\n')
+        f.write(('%10s' + '%10.3g' * 7) % ('Pruning ' + select_layer, *results) + '\n')
 
     torch.cuda.empty_cache()
 
