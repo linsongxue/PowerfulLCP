@@ -5,6 +5,7 @@ import math
 from copy import deepcopy
 from tqdm import tqdm
 import numpy as np
+import time
 
 import torch
 import torch.nn as nn
@@ -302,7 +303,7 @@ def channels_select(cfg, data, origin_model, pruning_model, aux_util, device, da
         aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
 
         mse_loss = torch.zeros(1).to(device)
-        mse_loss = MSE(pruned_features[0], origin_features[0])
+        mse_loss += MSE(pruned_features[0], origin_features[0])
 
         loss = mse_loss + hyp['joint_loss'] * (pruning_loss + aux_loss)
 
@@ -330,7 +331,7 @@ def channels_select(cfg, data, origin_model, pruning_model, aux_util, device, da
     pg0, pg1 = [], []
 
     grad = pruning_model.module_list[int(select_layer)].Conv2d.weight.grad.detach() ** 2
-    grad = torch.sum(grad, dim=(1, 2, 3))
+    grad = grad.sum((2, 3)).sqrt().sum(1)
     _, indices = torch.topk(grad, k)
     new_module = nn.Sequential()
     new_module.add_module('MaskConv2d',
@@ -390,7 +391,7 @@ def channels_select(cfg, data, origin_model, pruning_model, aux_util, device, da
         aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
 
         mse_loss = torch.zeros(1).to(device)
-        mse_loss += MSE(pruned_features[0], origin_features[0])
+        mse_loss += MSE(pruned_features[0][:, indices, :, :], origin_features[0][:, indices, :, :])
 
         loss = mse_loss + hyp['joint_loss'] * (pruning_loss + aux_loss)
 
@@ -525,6 +526,9 @@ def get_thin_model(cfg, data, weights, img_size, batch_size, accumulate, prune_r
         current_layer = aux_util.pruning_layer[0]
         optimizer_state = None
         aux_optimizer_state = None
+        with open(progress_result, 'a') as f:
+            t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            f.write('\n' + t)
     # ----------init model and aux net----------
 
     if first_prune:
@@ -535,7 +539,7 @@ def get_thin_model(cfg, data, weights, img_size, batch_size, accumulate, prune_r
 
     current_layer_index = aux_util.pruning_layer.index(current_layer)
     for layer in aux_util.pruning_layer[current_layer_index:]:
-        fine_tune(cfg, data, pruning_model, aux_util, device, train_loader, test_loader, current_layer, start_epoch,
+        fine_tune(cfg, data, pruning_model, aux_util, device, train_loader, test_loader, layer, start_epoch,
                   ft_epochs, optimizer_state, aux_optimizer_state)
         channels_select(cfg, data, origin_model, pruning_model, aux_util, device, channels_select_loader, layer,
                         prune_rate)
@@ -547,12 +551,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--prune-rate', type=float, default=0.7)
     parser.add_argument('--aux-epochs', type=int, default=10)
-    parser.add_argument('--ft-epochs', type=int, default=5)
+    parser.add_argument('--ft-epochs', type=int, default=15)
     parser.add_argument('--batch-size', type=int, default=16)  # effective bs = batch_size * accumulate = 16 * 4 = 64
     parser.add_argument('--accumulate', type=int, default=2, help='batches to accumulate before optimizing')
-    parser.add_argument('--cfg', type=str, default='cfg/yolov3.cfg', help='*.cfg path')
-    parser.add_argument('--weights', type=str, default='../weights/converted.pt', help='initial weights')
-    parser.add_argument('--data', type=str, default='data/coco2014.data', help='*.data path')
+    parser.add_argument('--cfg', type=str, default='cfg/yolov3-voc.cfg', help='*.cfg path')
+    parser.add_argument('--weights', type=str, default='../weights/converted-voc.pt', help='initial weights')
+    parser.add_argument('--data', type=str, default='data/voc.data', help='*.data path')
     parser.add_argument('--img-size', type=int, default=416, help='inference size (pixels)')
     parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1 or cpu)')
     parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')
