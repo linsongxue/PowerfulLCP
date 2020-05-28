@@ -108,12 +108,12 @@ class MaskConv2d(nn.Conv2d):
                                          stride=stride,
                                          padding=padding,
                                          bias=bias)
-        self.register_buffer("selected_channels_mask", torch.zeros(out_channels))
+        self.register_buffer("selected_channels_mask", torch.ones(in_channels))  # init the weight with original weight
 
     def forward(self, input):
-        mask = self.selected_channels_mask.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand_as(self.weight)
+        mask = self.selected_channels_mask.unsqueeze(0).unsqueeze(2).unsqueeze(3).expand_as(self.weight)
         return F.conv2d(input,
-                        self.weight.data.mul(mask),
+                        self.weight.mul(mask),
                         self.bias,
                         self.stride,
                         self.padding,
@@ -128,7 +128,7 @@ class MaskBatchNorm2d(nn.BatchNorm2d):
                                               momentum=momentum,
                                               affine=affine,
                                               track_running_stats=track_running_stats)
-        self.register_buffer("selected_channels_mask", torch.zeros(num_features))
+        self.register_buffer("selected_channels_mask", torch.ones(num_features))
 
     # copy from pytorch.org
     def forward(self, input):
