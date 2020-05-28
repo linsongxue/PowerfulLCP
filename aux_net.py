@@ -8,6 +8,7 @@ from utils.utils import wh_iou, bbox_iou
 import torch.optim as optim
 from tqdm import tqdm
 import torch.optim.lr_scheduler as lr_scheduler
+from collections import OrderedDict
 
 
 class HeadLayer(nn.Module):
@@ -254,22 +255,6 @@ class AuxNetUtils(object):
         for i in range(len(self.aux_list)):
             self.aux_list[i].load_state_dict(check_point["aux{}".format(i)], strict=True)
 
-    # def create_optimizer_for_fine_tune(self):
-    #     assert self.aux_list, "Please call 'Class.creat_aux_list' firstly!"
-    #     if self.optimizer_list:
-    #         self.optimizer_list = []
-    #     for i, net in enumerate(self.aux_list):
-    #         pg0, pg1 = [], []
-    #         for k, v in dict(net.named_parameters()).items():
-    #             if 'Conv2d.weight' in k:
-    #                 pg1 += [v]
-    #             else:
-    #                 pg0 += [v]
-    #         optimizer = optim.SGD(pg0, lr=self.hyp['lr0'], momentum=self.hyp['momentum'], nesterov=True)
-    #         optimizer.add_param_group({'params': pg1, 'weight_decay': self.hyp['weight_decay']})
-    #         self.optimizer_list.append(optimizer)
-    #         del pg0, pg1
-
     def cat_to_gpu0(self):
         device_list = list(self.hook_out.keys())
         for i in range(len(self.hook_out['gpu0'])):
@@ -280,51 +265,6 @@ class AuxNetUtils(object):
     def next_prune_layer(self, current_layer_name):
         index = self.pruning_layer.index(current_layer_name)
         return self.pruning_layer[index + 1]
-
-    @staticmethod
-    def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False):
-        # Returns the IoU of box1 to box2. box1 is 4, box2 is nx4
-        assert not GIoU or not DIoU, "Just can choice one mode!"
-        box1 = box1.t()
-        box2 = box2.t()
-
-        # Get the coordinates of bounding boxes
-        if x1y1x2y2:
-            # x1, y1, x2, y2 = box1
-            b1_x1, b1_y1, b1_x2, b1_y2 = box1[0], box1[1], box1[2], box1[3]
-            b2_x1, b2_y1, b2_x2, b2_y2 = box2[0], box2[1], box2[2], box2[3]
-        else:
-            # x, y, w, h = box1
-            b1_x1, b1_x2 = box1[0] - box1[2] / 2, box1[0] + box1[2] / 2
-            b1_y1, b1_y2 = box1[1] - box1[3] / 2, box1[1] + box1[3] / 2
-            b2_x1, b2_x2 = box2[0] - box2[2] / 2, box2[0] + box2[2] / 2
-            b2_y1, b2_y2 = box2[1] - box2[3] / 2, box2[1] + box2[3] / 2
-
-        # Intersection area
-        inter_area = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
-                     (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
-
-        # Union Area
-        union_area = ((b1_x2 - b1_x1) * (b1_y2 - b1_y1) + 1e-16) + \
-                     (b2_x2 - b2_x1) * (b2_y2 - b2_y1) - inter_area
-
-        iou = inter_area / union_area  # iou
-        if GIoU:  # Generalized IoU https://arxiv.org/pdf/1902.09630.pdf
-            c_x1, c_x2 = torch.min(b1_x1, b2_x1), torch.max(b1_x2, b2_x2)
-            c_y1, c_y2 = torch.min(b1_y1, b2_y1), torch.max(b1_y2, b2_y2)
-            c_area = (c_x2 - c_x1) * (c_y2 - c_y1)  # convex area
-            return iou - (c_area - union_area) / c_area  # GIoU
-
-        if DIoU:
-            box1_center = box1[0:2]
-            box2_center = box2[0:2]
-            c_x1, c_x2 = torch.min(b1_x1, b2_x1), torch.max(b1_x2, b2_x2)
-            c_y1, c_y2 = torch.min(b1_y1, b2_y1), torch.max(b1_y2, b2_y2)
-            inter_diag = torch.pow(box1_center[0] - box2_center[0], 2) + torch.pow(box1_center[1] - box2_center[1], 2)
-            out_diag = torch.pow(c_x1 - c_x2, 2) + torch.pow(c_y1 - c_y2, 2)
-            return iou - inter_diag / out_diag
-
-        return iou
 
     @staticmethod
     def build_targets_for_aux(model, targets):
@@ -516,3 +456,72 @@ class AuxNetUtils(object):
         # 把辅助网络列表也都删除
         aux_util.aux_list = []
         torch.cuda.empty_cache()
+
+
+class HookUtils(object):
+
+    def __init__(self):
+        self.origin_features = {}
+        self.prune_features = {}
+        for i in range(torch.cuda.device_count()):
+            self.origin_features['gpu{}'.format(i)] = []
+            self.prune_features['gpu{}'.format(i)] = []
+
+    def hook_origin_input(self, module, input, output):
+        self.origin_features['gpu{}'.format(input[0].device.index)].append(input[0])
+
+    def hook_prune_input(self, module, input, output):
+        self.prune_features['gpu{}'.format(input[0].device.index)].append(input[0])
+
+    def cat_to_gpu0(self, model='origin'):
+        device_list = list(self.origin_features.keys())
+        if model == 'origin':
+            assert self.origin_features['gpu0'], "Did not get hook features!"
+            for i in range(len(self.origin_features['gpu0'])):
+                for device in device_list[1:]:
+                    self.origin_features['gpu0'][i] = torch.cat(
+                        [self.origin_features['gpu0'][i], self.origin_features[device][i].cuda(0)],
+                        dim=0)
+
+        elif model == 'prune':
+            assert self.prune_features['gpu0'], "Did not get hook features!"
+            for i in range(len(self.prune_features['gpu0'])):
+                for device in device_list[1:]:
+                    self.prune_features['gpu0'][i] = torch.cat(
+                        [self.prune_features['gpu0'][i], self.prune_features[device][i].cuda(0)],
+                        dim=0)
+
+    def clean_hook_out(self, model='origin'):
+        if model == 'origin':
+            for key in list(self.origin_features.keys()):
+                self.origin_features[key] = []
+        if model == 'prune':
+            for key in list(self.prune_features.keys()):
+                self.prune_features[key] = []
+
+
+def mask_converted(mask_cfg='cfg/maskyolov3.cfg',
+                   weight_path='../weights/converted.pt',
+                   target='../weights/maskconverted.pt'):
+    last_darknet = 75
+    mask_weight = OrderedDict()
+    origin_weight = torch.load(weight_path)['model']
+    for k, v in origin_weight.items():
+        key_list = k.split('.')
+        idx = key_list[1]
+        if int(idx) < last_darknet and key_list[2] == 'Conv2d':
+            key_list[2] = 'Mask' + key_list[2]
+        key = '.'.join(key_list)
+        mask_weight[key] = v
+
+    model = Darknet(mask_cfg)
+    model.load_state_dict(mask_weight, strict=False)
+    if target is not None:
+        chkpt = {'epoch': -1,
+                 'best_fitness': None,
+                 'training_results': None,
+                 'model': model.state_dict(),
+                 'optimizer': None}
+        torch.save(chkpt, target)
+
+    return model.state_dict()

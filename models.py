@@ -54,7 +54,24 @@ def create_modules(module_defs, img_size, arc):
                                                         padding=pad,
                                                         deepwidth=True if size > 1 else False,
                                                         bn=bn))
-            if mdef['activation'] == 'leaky':  # TODO: activation study https://github.com/ultralytics/yolov3/issues/441
+            if mdef['activation'] == 'leaky':
+                modules.add_module('activation', nn.LeakyReLU(0.1, inplace=True))
+
+        elif mdef['type'] == 'maskconvolutional':
+            bn = int(mdef['batch_normalize'])
+            filters = int(mdef['filters'])
+            size = int(mdef['size'])
+            stride = int(mdef['stride']) if 'stride' in mdef else (int(mdef['stride_y']), int(mdef['stride_x']))
+            pad = (size - 1) // 2 if int(mdef['pad']) else 0
+            modules.add_module('MaskConv2d', MaskConv2d(in_channels=output_filters[-1],
+                                                        out_channels=filters,
+                                                        kernel_size=size,
+                                                        stride=stride,
+                                                        padding=pad,
+                                                        bias=not bn))
+            if bn:
+                modules.add_module('BatchNorm2d', nn.BatchNorm2d(filters, momentum=0.1))
+            if mdef['activation'] == 'leaky':
                 modules.add_module('activation', nn.LeakyReLU(0.1, inplace=True))
 
         elif mdef['type'] == 'maxpool':
