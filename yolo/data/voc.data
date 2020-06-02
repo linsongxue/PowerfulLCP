@@ -1,0 +1,6 @@
+classes=20
+train=./data/voc_train.txt
+valid=./data/voc_test.txt
+names=data/voc.names
+backup=backup/
+eval=voc

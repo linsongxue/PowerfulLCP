@@ -569,10 +569,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--prune-rate', type=float, default=0.7)
     parser.add_argument('--start_layer', type=str, default='1')
-    parser.add_argument('--aux-epochs', type=int, default=10)
+    parser.add_argument('--aux-epochs', type=int, default=50)
     parser.add_argument('--ft-epochs', type=int, default=15)
     parser.add_argument('--batch-size', type=int, default=16)  # effective bs = batch_size * accumulate = 16 * 4 = 64
-    parser.add_argument('--accumulate', type=int, default=2, help='batches to accumulate before optimizing')
+    parser.add_argument('--accumulate', type=int, default=1, help='batches to accumulate before optimizing')
     parser.add_argument('--cfg', type=str, default='cfg/yolov3-voc.cfg', help='*.cfg path')
     parser.add_argument('--weights', type=str, default='../weights/converted-voc.pt', help='initial weights')
     parser.add_argument('--data', type=str, default='data/voc.data', help='*.data path')
