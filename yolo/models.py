@@ -472,8 +472,3 @@ def attempt_download(weights):
             os.system('rm ' + weights)  # remove partial downloads
             raise Exception(msg)
 
-class SSD(nn.Module):
-
-    def __init__(self, cfg, img_size=(300, 300)):
-        super(SSD, self).__init__()
-

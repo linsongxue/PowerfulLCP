@@ -59,29 +59,29 @@ hyp = {'diou': 3.54,  # giou loss gain
 # mask_cfg_path = '/'.join(cfg.split('/')[:-1]) + '/mask' + cfg.split('/')[-1]
 # model = Darknet(mask_cfg_path)
 # print(model.state_dict()['module_list.0.MaskConv2d.weight'])
-def mask_converted(mask_cfg='cfg/maskyolov3.cfg',
-                   weight_path='converted.pt',
-                   target='maskconverted.pt'):
-    last_darknet = 75
-    mask_weight = OrderedDict()
-    origin_weight = torch.load(weight_path)['model']
-    for k, v in origin_weight.items():
-        key_list = k.split('.')
-        idx = key_list[1]
-        if int(idx) < last_darknet and key_list[2] == 'Conv2d':
-            key_list[2] = 'Mask' + key_list[2]
-        key = '.'.join(key_list)
-        mask_weight[key] = v
-
-    model = Darknet(mask_cfg)
-    model.load_state_dict(mask_weight, strict=False)
-    chkpt = {'epoch': -1,
-             'best_fitness': None,
-             'training_results': None,
-             'model': model.state_dict(),
-             'optimizer': None}
-    torch.save(chkpt, target)
-    return mask_weight
+# def mask_converted(mask_cfg='cfg/maskyolov3.cfg',
+#                    weight_path='converted.pt',
+#                    target='maskconverted.pt'):
+#     last_darknet = 75
+#     mask_weight = OrderedDict()
+#     origin_weight = torch.load(weight_path)['model']
+#     for k, v in origin_weight.items():
+#         key_list = k.split('.')
+#         idx = key_list[1]
+#         if int(idx) < last_darknet and key_list[2] == 'Conv2d':
+#             key_list[2] = 'Mask' + key_list[2]
+#         key = '.'.join(key_list)
+#         mask_weight[key] = v
+#
+#     model = Darknet(mask_cfg)
+#     model.load_state_dict(mask_weight, strict=False)
+#     chkpt = {'epoch': -1,
+#              'best_fitness': None,
+#              'training_results': None,
+#              'model': model.state_dict(),
+#              'optimizer': None}
+#     torch.save(chkpt, target)
+#     return mask_weight
 
 
 # mask_converted()
@@ -126,3 +126,18 @@ def mask_converted(mask_cfg='cfg/maskyolov3.cfg',
 #             ('FiTune ' + '0', '%g/%g' % (0, 14), *mloss, *results[:4]))
 # a = 3
 # print(a % 2 == 1)
+
+# model = Darknet('cfg/ssd-res50.cfg')
+# summary(model, torch.Tensor(1, 3, 300, 300))
+
+# a = [(1, 2, 3), (4, 5, 6), (7, 8, 9)]
+# b, c, d = list(zip(*a))
+# print(b)
+# print(c)
+# print(d)
+
+a = torch.ones(2, 10, 20, 20)
+b = torch.zeros(2, 10, 20, 20)
+MSE = nn.MSELoss(reduction='sum')
+l = MSE(a, b)
+print(l)
