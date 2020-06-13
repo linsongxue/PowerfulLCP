@@ -14,6 +14,7 @@ import torch.optim.lr_scheduler as lr_scheduler
 
 import test
 from models import Darknet
+from model_unit import MaskConv2d
 from utils.datasets import LoadImagesAndLabels
 from utils.utils import compute_loss, init_seeds
 from utils.torch_utils import select_device
@@ -87,7 +88,7 @@ def fine_tune(cfg, data, prune_cfg, aux_util, device, train_loader, test_loader,
     batch_size = train_loader.batch_size
     img_size = train_loader.dataset.img_size
     accumulate = 64 // batch_size
-    hook_util = HookUtils()
+    need_aux_net = True
 
     # ----------init pruned model----------
     pruned_model = Darknet(prune_cfg, img_size=(img_size, img_size)).to(device)
@@ -97,20 +98,12 @@ def fine_tune(cfg, data, prune_cfg, aux_util, device, train_loader, test_loader,
     pruned_model.load_state_dict(chkpt['model'], strict=True)
     current_layer_name = chkpt['current_layer']
     start_epoch = chkpt['epoch'] + 1
-    if start_epoch == epochs:
+    if start_epoch == epochs or current_layer_name == 'end':
         return current_layer_name  # fine tune 完毕，返回需要修剪的层名
 
     optimizer_state = chkpt['optimizer']
     aux_optimizer_state = chkpt['aux_optimizer']
     del chkpt
-
-    aux_idx = aux_util.conv_layer_dict[current_layer_name]
-    hook_layer = aux_util.down_sample_layer[aux_idx]
-    aux_loss_scalar = max(0.01, pow((int(hook_layer) + 1) / 75, 2))
-    aux_net = aux_util.creat_aux_list(img_size, device, conv_layer_name=current_layer_name)
-    chkpt_aux = torch.load(aux_weight, map_location=device)
-    aux_net.load_state_dict(chkpt_aux['aux{}'.format(aux_idx)])
-    del chkpt_aux
 
     # ----------init optimizer for pruned model----------
     pg0, pg1 = [], []  # optimizer parameter groups
@@ -122,39 +115,49 @@ def fine_tune(cfg, data, prune_cfg, aux_util, device, train_loader, test_loader,
     pruned_optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
     pruned_optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
     del pg0, pg1
-    # ----------init optimizer for pruned model----------
 
-    # -------------init optimizer for aux net-------------
-    pg0, pg1 = [], []  # optimizer parameter groups
-    for k, v in dict(aux_net.named_parameters()).items():
-        if 'Conv2d.weight' in k:
-            pg1 += [v]  # parameter group 1 (apply weight_decay)
-        else:
-            pg0 += [v]  # parameter group 0
-    aux_optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
-    aux_optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
-    del pg0, pg1
-    # -------------init optimizer for aux net-------------
-
-    if optimizer_state is not None and aux_optimizer_state is not None:
+    if optimizer_state is not None:
         pruned_optimizer.load_state_dict(optimizer_state)
-        aux_optimizer.load_state_dict(aux_optimizer_state)
 
     p_scheduler = lr_scheduler.MultiStepLR(pruned_optimizer, milestones=[epochs // 3, 2 * (epochs // 3)], gamma=0.1)
-    a_scheduler = lr_scheduler.MultiStepLR(aux_optimizer, milestones=[epochs // 3, 2 * (epochs // 3)], gamma=0.1)
     p_scheduler.last_epoch = start_epoch - 1
-    a_scheduler.last_epoch = start_epoch - 1
+    # ----------init optimizer for pruned model----------
 
-    # ----------------apex and distributed----------------
-    if mixed_precision:
-        pruned_model, pruned_optimizer = amp.initialize(pruned_model, pruned_optimizer, opt_level='O1', verbosity=0)
-        aux_net, aux_optimizer = amp.initialize(aux_net, aux_optimizer, opt_level='O1', verbosity=0)
     if device.type != 'cpu' and torch.cuda.device_count() > 1:
         pruned_model = torch.nn.parallel.DistributedDataParallel(pruned_model, find_unused_parameters=True)
         pruned_model.yolo_layers = pruned_model.module.yolo_layers
+
+    aux_idx = aux_util.conv_layer_dict[current_layer_name]
+    if aux_idx == -1:
+        need_aux_net = False
+    else:
+        hook_util = HookUtils()
+
+        hook_layer = aux_util.down_sample_layer[aux_idx]
+        aux_loss_scalar = max(0.01, pow((int(hook_layer) + 1) / 75, 2))
+        aux_net = aux_util.creat_aux_list(img_size, device, conv_layer_name=current_layer_name)
+        chkpt_aux = torch.load(aux_weight, map_location=device)
+        aux_net.load_state_dict(chkpt_aux['aux{}'.format(aux_idx)])
+        del chkpt_aux
+
+        # -------------init optimizer for aux net-------------
+        pg0, pg1 = [], []  # optimizer parameter groups
+        for k, v in dict(aux_net.named_parameters()).items():
+            if 'Conv2d.weight' in k:
+                pg1 += [v]  # parameter group 1 (apply weight_decay)
+            else:
+                pg0 += [v]  # parameter group 0
+        aux_optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+        aux_optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
+        del pg0, pg1
+
+        if aux_optimizer_state is not None:
+            aux_optimizer.load_state_dict(aux_optimizer_state)
+
+        a_scheduler = lr_scheduler.MultiStepLR(aux_optimizer, milestones=[epochs // 3, 2 * (epochs // 3)], gamma=0.1)
+        a_scheduler.last_epoch = start_epoch - 1
+        # -------------init optimizer for aux net-------------
         aux_net = torch.nn.parallel.DistributedDataParallel(aux_net, find_unused_parameters=True)
-        # aux_net.head = aux_net.module.head
-    # ----------------apex and distributed----------------
 
     # -------------start train-------------
     nb = len(train_loader)
@@ -164,18 +167,15 @@ def fine_tune(cfg, data, prune_cfg, aux_util, device, train_loader, test_loader,
     for epoch in range(start_epoch, epochs):
 
         # -------------register hook for model-------------
-        if device.type != 'cpu' and torch.cuda.device_count() > 1:
+        if need_aux_net:
             for name, child in pruned_model.module.module_list.named_children():
-                if name == hook_layer:
-                    handle = child.register_forward_hook(hook_util.hook_prune_input)
-        else:
-            for name, child in pruned_model.module_list.named_children():
                 if name == hook_layer:
                     handle = child.register_forward_hook(hook_util.hook_prune_input)
         # -------------register hook for model-------------
 
         pruned_model.train()
-        aux_net.train()
+        if need_aux_net:
+            aux_net.train()
 
         print(('\n' + '%10s' * 8) % ('Stage', 'Epoch', 'gpu_mem', 'DIoU', 'obj', 'cls', 'total', 'targets'))
 
@@ -194,26 +194,26 @@ def fine_tune(cfg, data, prune_cfg, aux_util, device, train_loader, test_loader,
             pruned_loss, pruned_loss_items = compute_loss(pruned_pred, targets, pruned_model)
             pruned_loss *= batch_size / 64
 
-            hook_util.cat_to_gpu0(model='prune')
-            aux_pred = aux_net(hook_util.prune_features['gpu0'][0])
-            aux_loss, aux_loss_items = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
-            aux_loss *= aux_loss_scalar * batch_size / 64
-
-            if mixed_precision:
-                with amp.scale_loss(pruned_loss, pruned_optimizer) as pruned_scaled_loss:
-                    pruned_scaled_loss.backward(retain_graph=True)
-                with amp.scale_loss(aux_loss, aux_optimizer) as aux_scaled_loss:
-                    aux_scaled_loss.backward()
+            if need_aux_net:
+                hook_util.cat_to_gpu0(model='prune')
+                aux_pred = aux_net(hook_util.prune_features['gpu0'][0])
+                aux_loss, aux_loss_items = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
+                aux_loss *= aux_loss_scalar * batch_size / 64
             else:
-                pruned_loss.backward(retain_graph=True)
-                aux_loss.backward()
+                aux_loss = torch.zeros(1, dtype=pruned_loss.dtype, device=pruned_loss.device)
+                aux_loss_items = torch.zeros(3, dtype=pruned_loss.dtype, device=pruned_loss.device)
 
-            hook_util.clean_hook_out(model='prune')
+            loss = pruned_loss + aux_loss
+            loss.backward()
+
+            if need_aux_net:
+                hook_util.clean_hook_out(model='prune')
             if ni % accumulate == 0:
                 pruned_optimizer.step()
-                aux_optimizer.step()
                 pruned_optimizer.zero_grad()
-                aux_optimizer.zero_grad()
+                if need_aux_net:
+                    aux_optimizer.step()
+                    aux_optimizer.zero_grad()
 
             pruned_loss_items[0] += aux_loss_items[0]
             pruned_loss_items[2] += aux_loss_items[1]
@@ -226,9 +226,10 @@ def fine_tune(cfg, data, prune_cfg, aux_util, device, train_loader, test_loader,
             pbar.set_description(s)
         # -------------end batch-------------
 
-        handle.remove()
         p_scheduler.step()
-        a_scheduler.step()
+        if need_aux_net:
+            handle.remove()
+            a_scheduler.step()
 
         results, _ = test.test(cfg,
                                data,
@@ -245,7 +246,7 @@ def fine_tune(cfg, data, prune_cfg, aux_util, device, train_loader, test_loader,
                  'model': pruned_model.module.state_dict() if type(
                      pruned_model) is nn.parallel.DistributedDataParallel else pruned_model.state_dict(),
                  'optimizer': None if epoch == epochs - 1 else pruned_optimizer.state_dict(),
-                 'aux_optimizer': None if epoch == epochs - 1 else aux_optimizer.state_dict()}
+                 'aux_optimizer': None if epoch == epochs - 1 or not need_aux_net else aux_optimizer.state_dict()}
 
         torch.save(chkpt, progress_chkpt)
 
@@ -256,11 +257,12 @@ def fine_tune(cfg, data, prune_cfg, aux_util, device, train_loader, test_loader,
 
         del chkpt
 
-        chkpt_aux = torch.load(aux_weight, map_location=device)
-        chkpt_aux['aux{}'.format(aux_idx)] = aux_net.module.state_dict() if type(
-            aux_net) is nn.parallel.DistributedDataParallel else aux_net.state_dict()
-        torch.save(chkpt_aux, aux_weight)
-        del chkpt_aux
+        if need_aux_net:
+            chkpt_aux = torch.load(aux_weight, map_location=device)
+            chkpt_aux['aux{}'.format(aux_idx)] = aux_net.module.state_dict() if type(
+                aux_net) is nn.parallel.DistributedDataParallel else aux_net.state_dict()
+            torch.save(chkpt_aux, aux_weight)
+            del chkpt_aux
 
         with open(progress_result, 'a') as f:
             f.write(('%10s' * 2 + '%10.3g' * 8) % (
@@ -279,6 +281,7 @@ def channels_select(cfg, data, origin_model, prune_cfg, aux_util, device, data_l
     batch_size = data_loader.batch_size
     img_size = data_loader.dataset.img_size
     accumulate = 64 // batch_size
+    need_aux_net = True
     hook_util = HookUtils()
     handles = []
 
@@ -300,16 +303,19 @@ def channels_select(cfg, data, origin_model, prune_cfg, aux_util, device, data_l
     # ----------prepare to get pruned feature maps----------
     aux_idx = aux_util.conv_layer_dict[select_layer]
     hook_layer_aux = aux_util.down_sample_layer[aux_idx]
+    if aux_idx == -1:
+        need_aux_net = False
     for name, child in pruning_model.module_list.named_children():
         if name == select_layer:
             handles.append(child.BatchNorm2d.register_forward_hook(hook_util.hook_prune_input))
-        elif name == hook_layer_aux:
+        elif name == hook_layer_aux and need_aux_net:
             handles.append(child.register_forward_hook(hook_util.hook_prune_input))
 
-    aux_net = aux_util.creat_aux_list(img_size, device, conv_layer_name=select_layer)
-    chkpt_aux = torch.load(aux_weight, map_location=device)
-    aux_net.load_state_dict(chkpt_aux['aux{}'.format(aux_idx)])
-    del chkpt_aux
+    if need_aux_net:
+        aux_net = aux_util.creat_aux_list(img_size, device, conv_layer_name=select_layer)
+        chkpt_aux = torch.load(aux_weight, map_location=device)
+        aux_net.load_state_dict(chkpt_aux['aux{}'.format(aux_idx)])
+        del chkpt_aux
     # ----------prepare to get pruned feature maps----------
 
     if device.type != 'cpu' and torch.cuda.device_count() > 1:
@@ -317,14 +323,16 @@ def channels_select(cfg, data, origin_model, prune_cfg, aux_util, device, data_l
         origin_model.yolo_layers = origin_model.module.yolo_layers
         pruning_model = torch.nn.parallel.DistributedDataParallel(pruning_model, find_unused_parameters=True)
         pruning_model.yolo_layers = pruning_model.module.yolo_layers
-        aux_net = torch.nn.parallel.DistributedDataParallel(aux_net, find_unused_parameters=True)
+        if need_aux_net:
+            aux_net = torch.nn.parallel.DistributedDataParallel(aux_net, find_unused_parameters=True)
 
     nb = len(data_loader)
     pruning_model.nc = 80
     pruning_model.hyp = hyp
     pruning_model.arc = 'default'
     pruning_model.eval()
-    aux_net.eval()
+    if need_aux_net:
+        aux_net.eval()
     MSE = nn.MSELoss(reduction='mean')
     pbar = tqdm(enumerate(data_loader), total=nb)
     print(('\n' + '%10s' * 7) % ('Stage', 'gpu_mem', 'MSELoss', 'PdLoss', 'AuxLoss', 'Total', 'targets'))
@@ -344,13 +352,18 @@ def channels_select(cfg, data, origin_model, prune_cfg, aux_util, device, data_l
         pruning_loss, _ = compute_loss(pruning_pred, targets, pruning_model)
         hook_util.cat_to_gpu0('prune')
 
-        aux_pred = aux_net(hook_util.prune_features['gpu0'][1])
-        aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
+        if need_aux_net:
+            aux_pred = aux_net(hook_util.prune_features['gpu0'][1])
+            aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
 
         mse_loss = torch.zeros(1).to(device)
         mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
 
-        loss = hyp['joint_loss'] * mse_loss + pruning_loss + aux_loss
+        if need_aux_net:
+            loss = hyp['joint_loss'] * mse_loss + pruning_loss + aux_loss
+        else:
+            aux_loss = torch.zeros(1)
+            loss = hyp['joint_loss'] * mse_loss + pruning_loss
 
         loss.backward()
 
@@ -376,7 +389,10 @@ def channels_select(cfg, data, origin_model, prune_cfg, aux_util, device, data_l
         grad = pruning_model.module_list[int(select_layer)].MaskConv2d.weight.grad.detach() ** 2
     grad = grad.sum((2, 3)).sqrt().sum(0)
     _, indices = torch.topk(grad, k, largest=False)
-    pruning_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask[indices] = 0
+    if device.type != 'cpu' and torch.cuda.device_count() > 1:
+        pruning_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask[indices] = 0
+    else:
+        pruning_model.module_list[int(select_layer)].MaskConv2d.selected_channels_mask[indices] = 0
 
     pruning_model.zero_grad()
 
@@ -399,13 +415,18 @@ def channels_select(cfg, data, origin_model, prune_cfg, aux_util, device, data_l
         pruning_loss, _ = compute_loss(pruning_pred, targets, pruning_model)
         hook_util.cat_to_gpu0('prune')
 
-        aux_pred = aux_net(hook_util.prune_features['gpu0'][1])
-        aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
+        if need_aux_net:
+            aux_pred = aux_net(hook_util.prune_features['gpu0'][1])
+            aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
 
         mse_loss = torch.zeros(1).to(device)
         mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
 
-        loss = hyp['joint_loss'] * mse_loss + pruning_loss + aux_loss
+        if need_aux_net:
+            loss = hyp['joint_loss'] * mse_loss + pruning_loss + aux_loss
+        else:
+            aux_loss = torch.zeros(1)
+            loss = hyp['joint_loss'] * mse_loss + pruning_loss
 
         loss.backward()
 
@@ -430,7 +451,11 @@ def channels_select(cfg, data, origin_model, prune_cfg, aux_util, device, data_l
         handle.remove()
     # ----------update weight to solve sub problem----------
 
-    chkpt = {'current_layer': aux_util.next_prune_layer(select_layer),
+    if select_layer == aux_util.pruning_layer[-1]:
+        current_layer = 'end'
+    else:
+        current_layer = aux_util.next_prune_layer(select_layer)
+    chkpt = {'current_layer': current_layer,
              'epoch': -1,
              'model': pruning_model.module.state_dict() if type(
                  pruning_model) is nn.parallel.DistributedDataParallel else pruning_model.state_dict(),
@@ -529,7 +554,7 @@ def get_thin_model(cfg, data, origin_weights, img_size, batch_size, accumulate, 
         mask_mdfs = []
         last_darknet = 75
         for i, mdf in enumerate(origin_mdfs):
-            if i < last_darknet and mdf['type'] == 'convolutional':
+            if i <= last_darknet and mdf['type'] == 'convolutional':
                 mdf['type'] = 'maskconvolutional'
             mask_mdfs.append(mdf)
         write_cfg(mask_cfg, mask_mdfs)
@@ -560,9 +585,100 @@ def get_thin_model(cfg, data, origin_weights, img_size, batch_size, accumulate, 
         # ----------start from first layer----------
 
     layer = start_layer
+    if start_layer == 'end':
+        return mask_cfg, aux_util
+
     while int(layer) <= int(aux_util.pruning_layer[-1]):
         layer = fine_tune(cfg, data, mask_cfg, aux_util, device, train_loader, test_loader, ft_epochs)
+        if layer == 'end':
+            break
         channels_select(cfg, data, origin_model, mask_cfg, aux_util, device, channels_select_loader, layer, prune_rate)
+
+    return mask_cfg, aux_util
+
+
+def pruning(mask_cfg, progress_weights, aux_util):
+    device_in = torch.device('cpu')
+    model = Darknet(mask_cfg)
+    chkpt = torch.load(progress_weights, map_location=device_in)
+    model.load_state_dict(chkpt['model'])
+
+    new_cfg = parse_model_cfg(mask_cfg)
+
+    route_layer = ['37', '62']
+    route_mask = [None, None]
+    for layer in aux_util.pruning_layer:
+        assert isinstance(model.module_list[int(layer)][0], MaskConv2d), "Not a pruned model!"
+        in_channels_mask = model.module_list[int(layer)][0].selected_channels_mask
+        out_channels_mask = torch.ones(model.module_list[int(layer)][0].out_channels)
+        if layer != aux_util.pruning_layer[-1]:
+            out_channels_mask = model.module_list[int(aux_util.next_prune_layer(layer))][0].selected_channels_mask
+
+        in_channels = int(torch.sum(in_channels_mask))
+        out_channels = int(torch.sum(out_channels_mask))
+
+        new_cfg[int(layer) + 1]['type'] = 'convolutional'
+        new_cfg[int(layer) + 1]['filters'] = str(out_channels)
+
+        new_conv2d = nn.Conv2d(in_channels,
+                               out_channels,
+                               kernel_size=model.module_list[int(layer)][0].kernel_size,
+                               stride=model.module_list[int(layer)][0].stride,
+                               padding=model.module_list[int(layer)][0].padding,
+                               bias=False)
+        thin_weight = model.module_list[int(layer)][0].weight[out_channels_mask.bool()]
+        thin_weight = thin_weight[:, in_channels_mask.bool()]
+        new_conv2d.weight.data.copy_(thin_weight.data)
+
+        new_batch = nn.BatchNorm2d(out_channels, momentum=0.1)
+        thin_weight = model.module_list[int(layer)][1].weight[out_channels_mask.bool()]
+        thin_bias = model.module_list[int(layer)][1].bias[out_channels_mask.bool()]
+        thin_mean = model.module_list[int(layer)][1].running_mean[out_channels_mask.bool()]
+        thin_var = model.module_list[int(layer)][1].running_var[out_channels_mask.bool()]
+
+        new_batch.weight.data.copy_(thin_weight)
+        new_batch.bias.data.copy_(thin_bias)
+        new_batch.running_mean.copy_(thin_mean)
+        new_batch.running_var.copy_(thin_var)
+        new_module = nn.Sequential()
+        new_module.add_module('Conv2d', new_conv2d)
+        new_module.add_module('BatchNorm2d', new_batch)
+        new_module.add_module('activation', model.module_list[int(layer)][2])
+        model.module_list[int(layer)] = new_module
+
+        if layer == route_layer[0]:
+            mask = torch.cat([torch.ones(model.module_list[96][0].out_channels), in_channels_mask], 0)
+            route_mask[0] = mask
+        elif layer == route_layer[1]:
+            mask = torch.cat([torch.ones(model.module_list[84][0].out_channels), in_channels_mask], 0)
+            route_mask[1] = mask
+
+    new_conv2d_87 = nn.Conv2d(in_channels=int(torch.sum(route_mask[1])),
+                              out_channels=model.module_list[87][0].out_channels,
+                              kernel_size=model.module_list[87][0].kernel_size,
+                              stride=model.module_list[87][0].stride,
+                              padding=model.module_list[87][0].padding,
+                              bias=False)
+    new_conv2d_87.weight.data.copy_(model.module_list[87][0].weight.data[:, route_mask[1].bool()])
+
+    new_conv2d_99 = nn.Conv2d(in_channels=int(torch.sum(route_mask[0])),
+                              out_channels=model.module_list[99][0].out_channels,
+                              kernel_size=model.module_list[99][0].kernel_size,
+                              stride=model.module_list[99][0].stride,
+                              padding=model.module_list[99][0].padding,
+                              bias=False)
+    new_conv2d_99.weight.data.copy_(model.module_list[99][0].weight.data[:, route_mask[0].bool()])
+
+    model.module_list[87][0] = new_conv2d_87
+    model.module_list[99][0] = new_conv2d_99
+
+    write_cfg('cfg/pruned-yolov3.cfg', new_cfg)
+    chkpt = {'epoch': -1,
+             'best_fitness': None,
+             'training_results': None,
+             'model': model.state_dict(),
+             'optimizer': None}
+    torch.save(chkpt, '../weights/pruned-converted.pt')
 
 
 if __name__ == '__main__':
@@ -592,14 +708,16 @@ if __name__ == '__main__':
                                 world_size=1,  # number of nodes for distributed training
                                 rank=0)  # distributed training node rank
 
-    get_thin_model(cfg=opt.cfg,
-                   data=opt.data,
-                   origin_weights=opt.weights,
-                   img_size=opt.img_size,
-                   batch_size=opt.batch_size,
-                   accumulate=opt.accumulate,
-                   prune_rate=opt.prune_rate,
-                   aux_epochs=opt.aux_epochs,
-                   ft_epochs=opt.ft_epochs,
-                   resume=opt.resume,
-                   cache_images=opt.cache_images)
+    mask_cfg, aux_util = get_thin_model(cfg=opt.cfg,
+                                        data=opt.data,
+                                        origin_weights=opt.weights,
+                                        img_size=opt.img_size,
+                                        batch_size=opt.batch_size,
+                                        accumulate=opt.accumulate,
+                                        prune_rate=opt.prune_rate,
+                                        aux_epochs=opt.aux_epochs,
+                                        ft_epochs=opt.ft_epochs,
+                                        resume=opt.resume,
+                                        cache_images=opt.cache_images)
+
+    pruning(mask_cfg, progress_chkpt, aux_util)

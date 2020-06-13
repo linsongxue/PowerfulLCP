@@ -24,16 +24,11 @@ def parse_model_cfg(path):
         else:
             key, val = line.split("=")
             key = key.rstrip()
-
-            if 'anchors' in key:
-                mdefs[-1][key] = np.array([float(x) for x in val.split(',')]).reshape((-1, 2))  # np anchors
-            else:
-                mdefs[-1][key] = val.strip()
+            mdefs[-1][key] = val.strip()
 
     # Check all fields are supported
     supported = ['type', 'batch_normalize', 'filters', 'size', 'stride', 'pad', 'activation', 'layers', 'groups',
-                 'from', 'mask', 'anchors', 'classes', 'num', 'jitter', 'ignore_thresh', 'truth_thresh', 'random',
-                 'stride_x', 'stride_y']
+                 'from', 'anchors', 'classes', 'min', 'max', 'feature']
 
     f = []  # fields
     for x in mdefs[1:]:

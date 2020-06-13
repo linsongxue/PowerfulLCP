@@ -164,9 +164,11 @@ class SSD(nn.Module):
             if mtype in ['convolutional', 'maxpool', 'maskconvolutional']:
                 input = module(input)
             elif mtype == 'route':
-                layers = [int(x) for x in mdef['layers'].split(',')]
-                assert len(layers) == 1, "SSD don not support two route two layers"
-                input = layer_outputs[layers[0]]
+                layers = int(mdef['layers'])
+                input = layer_outputs[layers]
+                # layers = [int(x) for x in mdef['layers'].split(',')]
+                # assert len(layers) == 1, "SSD don not support two route two layers"
+                # input = layer_outputs[layers[0]]
             elif mtype == 'shortcut':
                 input = module(input + layer_outputs[int(mdef['from'])])
             elif mtype == 'ssd':
@@ -189,13 +191,25 @@ class SSD(nn.Module):
         return output
 
 
-model = SSD('cfg/ssd-res50.cfg', 300)
-model.train()
-# print(model.module_defs)
+# model = SSD('cfg/ssd-res50.cfg', 300)
 # print(model)
-# summary(model, torch.Tensor(1, 3, 300, 300))
-a = torch.ones(1, 3, 300, 300)
-out = model(a)
-print(out[0].shape)
-print(out[1].shape)
-print(out[2].shape)
+# model.train()
+# # print(model.module_defs)
+# # print(model)
+# # summary(model, torch.Tensor(1, 3, 300, 300))
+# a = torch.ones(1, 3, 300, 300)
+# out = model(a)
+# print(out[0].shape)
+# print(out[1].shape)
+# print(out[2].shape)
+
+# chkpt = torch.load('resnet50.pth')
+# for k, v in chkpt.items():
+#     print(k)
+# for k, v in model.state_dict().items():
+#     print(k)
+from torchvision import models
+
+modelr = models.resnet50(pretrained=True)
+for k, v in modelr.named_children():
+    print(k, '-->', isinstance(v, nn.Sequential))

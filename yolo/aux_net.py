@@ -216,7 +216,7 @@ class AuxNetUtils(object):
                 joint_loss_index.append(index)
 
         self.conv_layer_dict = dict(zip(self.conv_layer_dict, joint_loss_index))
-        self.conv_layer_dict.pop(str(last_darknet))
+        self.conv_layer_dict[str(last_darknet)] = -1
 
         self.pruning_layer = list(self.conv_layer_dict.keys())
 
@@ -264,7 +264,10 @@ class AuxNetUtils(object):
 
     def next_prune_layer(self, current_layer_name):
         index = self.pruning_layer.index(current_layer_name)
-        return self.pruning_layer[index + 1]
+        if (index + 1) == len(self.pruning_layer):
+            return self.pruning_layer[-1]
+        else:
+            return self.pruning_layer[index + 1]
 
     @staticmethod
     def build_targets_for_aux(model, targets):
@@ -509,7 +512,7 @@ def mask_converted(mask_cfg='cfg/maskyolov3.cfg',
     for k, v in origin_weight.items():
         key_list = k.split('.')
         idx = key_list[1]
-        if int(idx) < last_darknet and key_list[2] == 'Conv2d':
+        if int(idx) <= last_darknet and key_list[2] == 'Conv2d':
             key_list[2] = 'Mask' + key_list[2]
         key = '.'.join(key_list)
         mask_weight[key] = v
