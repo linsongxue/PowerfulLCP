@@ -44,9 +44,8 @@ logging.basicConfig(filename=compare_analyse, filemode='a', format='%(asctime)s 
 logger = logging.getLogger()
 
 
-def compare_channel_select(origin_model, prune_cfg, select_layer, device, aux_util, data_loader, pruned_rate):
-
-    origin_weights = origin_model.state_dict()
+def greedy_channel_select(origin_model, prune_cfg, origin_weights, select_layer, device, aux_util, data_loader,
+                          pruned_rate):
     init_state_dict = mask_converted(prune_cfg, origin_weights, target=None)
 
     prune_model = Darknet(prune_cfg).to(device)
@@ -57,7 +56,6 @@ def compare_channel_select(origin_model, prune_cfg, select_layer, device, aux_ut
                                             momentum=hyp['momentum'])
     hook_util = HookUtils()
     handles = []
-    accumulate = 64 // data_loader.batch_size
 
     info = aux_util.layer_info[int(select_layer)]
     in_channels = info['in_channels']
@@ -82,8 +80,6 @@ def compare_channel_select(origin_model, prune_cfg, select_layer, device, aux_ut
     del chkpt_aux
 
     if device.type != 'cpu' and torch.cuda.device_count() > 1:
-        origin_model = torch.nn.parallel.DistributedDataParallel(origin_model, find_unused_parameters=True)
-        origin_model.yolo_layers = origin_model.module.yolo_layers
         prune_model = torch.nn.parallel.DistributedDataParallel(prune_model, find_unused_parameters=True)
         prune_model.yolo_layers = prune_model.module.yolo_layers
         aux_net = torch.nn.parallel.DistributedDataParallel(aux_net, find_unused_parameters=True)
@@ -96,11 +92,10 @@ def compare_channel_select(origin_model, prune_cfg, select_layer, device, aux_ut
     aux_net.eval()
     MSE = nn.MSELoss(reduction='mean')
 
-    no_greedy = torch.zeros(k, dtype=torch.int64)
-    greedy = torch.zeros(k, dtype=torch.int64)
+    greedy = torch.zeros(k)
     for i_k in range(k):
         pbar = tqdm(enumerate(data_loader), total=nb)
-        print(('\n' + '%10s' * 7) % ('Stage', 'gpu_mem', 'MSELoss', 'PdLoss', 'AuxLoss', 'Total', 'targets'))
+        print(('\n' + '%10s' * 8) % ('Stage', 'gpu_mem', 'iter', 'MSELoss', 'PdLoss', 'AuxLoss', 'Total', 'targets'))
         for i, (imgs, targets, _, _) in pbar:
             if len(targets) == 0:
                 continue
@@ -110,50 +105,49 @@ def compare_channel_select(origin_model, prune_cfg, select_layer, device, aux_ut
 
             with torch.no_grad():
                 _ = origin_model(imgs)
-            hook_util.cat_to_gpu0('origin')
 
             _, pruning_pred = prune_model(imgs)
             pruning_loss, _ = compute_loss(pruning_pred, targets, prune_model)
             hook_util.cat_to_gpu0('prune')
 
-            aux_pred = aux_net(hook_util.prune_features['gpu0'][1])
+            aux_pred = aux_net(hook_util.pruned_features['gpu0'][1])
             aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
 
             mse_loss = torch.zeros(1).to(device)
-            mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
+            mse_loss += MSE(hook_util.pruned_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
 
             loss = hyp['joint_loss'] * mse_loss + pruning_loss + aux_loss
 
             loss.backward()
 
             mem = torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0
-            s = ('%10s' * 2 + '%10.3g' * 5) % (
-                'Pruning ' + select_layer, '%.3gG' % mem, mse_loss, pruning_loss, aux_loss, loss, len(targets))
+            s = ('%10s' * 3 + '%10.3g' * 5) % (
+                'Pruning ' + select_layer, '%.3gG' % mem, '%g/%g' % (i_k, k), mse_loss, pruning_loss, aux_loss, loss,
+                len(targets))
             pbar.set_description(s)
 
             hook_util.clean_hook_out('origin')
             hook_util.clean_hook_out('prune')
 
-        if device.type != 'cpu' and torch.cuda.device_count() > 1:
-            grad = prune_model.module.module_list[int(select_layer)].MaskConv2d.weight.grad.detach() ** 2
-        else:
-            grad = prune_model.module_list[int(select_layer)].MaskConv2d.weight.grad.detach() ** 2
+        grad = prune_model.module.module_list[int(select_layer)].MaskConv2d.weight.grad.detach().clone() ** 2
         grad = grad.sum((2, 3)).sqrt().sum(0)
 
         if i_k == 0:
-            _, no_greedy = torch.topk(grad, k)
-            prune_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask[:] = 0
+            prune_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask[:] = 1e-5
+            _, non_greedy_indices = torch.topk(grad, k)
+            logger.info('non greedy layer{}: selected==>{}'.format(select_layer, str(non_greedy_indices)))
 
         selected_channels_mask = prune_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask
         _, indices = torch.topk(grad * (1 - selected_channels_mask), 1)
         prune_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask[indices] = 1
         greedy[i_k] = indices
+        logger.info('greedy layer{} iter{}: indices==>{}'.format(select_layer, str(i_k), str(indices)))
 
         prune_model.zero_grad()
 
         pbar = tqdm(enumerate(data_loader), total=nb)
         mloss = torch.zeros(4).to(device)
-        print(('\n' + '%10s' * 7) % ('Stage', 'gpu_mem', 'MSELoss', 'PdLoss', 'AuxLoss', 'Total', 'targets'))
+        print(('\n' + '%10s' * 8) % ('Stage', 'gpu_mem', 'iter', 'MSELoss', 'PdLoss', 'AuxLoss', 'Total', 'targets'))
         for i, (imgs, targets, _, _) in pbar:
 
             if len(targets) == 0:
@@ -164,30 +158,28 @@ def compare_channel_select(origin_model, prune_cfg, select_layer, device, aux_ut
 
             with torch.no_grad():
                 _ = origin_model(imgs)
-            hook_util.cat_to_gpu0('origin')
 
             _, pruning_pred = prune_model(imgs)
             pruning_loss, _ = compute_loss(pruning_pred, targets, prune_model)
             hook_util.cat_to_gpu0('prune')
 
-            aux_pred = aux_net(hook_util.prune_features['gpu0'][1])
+            aux_pred = aux_net(hook_util.pruned_features['gpu0'][1])
             aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
 
             mse_loss = torch.zeros(1).to(device)
-            mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
+            mse_loss += MSE(hook_util.pruned_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
 
             loss = hyp['joint_loss'] * mse_loss + pruning_loss + aux_loss
 
             loss.backward()
 
-            if i % accumulate == 0:
-                solve_sub_problem_optimizer.step()
-                solve_sub_problem_optimizer.zero_grad()
+            solve_sub_problem_optimizer.step()
+            solve_sub_problem_optimizer.zero_grad()
 
             mem = torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0
             mloss = (mloss * i + torch.cat([mse_loss, pruning_loss, aux_loss, loss]).detach()) / (i + 1)
-            s = ('%10s' * 2 + '%10.3g' * 5) % (
-                'SubProm ' + select_layer, '%.3gG' % mem, *mloss, len(targets))
+            s = ('%10s' * 3 + '%10.3g' * 5) % (
+                'SubProm ' + select_layer, '%.3gG' % mem, '%g/%g' % (i_k, k), *mloss, len(targets))
             pbar.set_description(s)
 
             hook_util.clean_hook_out('origin')
@@ -196,14 +188,157 @@ def compare_channel_select(origin_model, prune_cfg, select_layer, device, aux_ut
     for handle in handles:
         handle.remove()
 
-    no_greedy = no_greedy.cpu().tolist()
-    greedy = greedy.cpu().tolist()
-    a = 0
-    for c in no_greedy:
-        if c in greedy:
-            a += 1
-    ratio = a / k
-    logger.info(("no greedy / greedy ==>" + str(ratio)))
+    logger.info(("greedy layer{}: selected==>{}".format(select_layer, str(greedy))))
+
+
+def random_greedy_channel_select(origin_model, prune_cfg, origin_weights, select_layer, device, aux_util, data_loader,
+                                 pruned_rate):
+    init_state_dict = mask_converted(prune_cfg, origin_weights, target=None)
+
+    prune_model = Darknet(prune_cfg).to(device)
+    prune_model.load_state_dict(init_state_dict, strict=True)
+    del init_state_dict
+    solve_sub_problem_optimizer = optim.SGD(prune_model.module_list[int(select_layer)].MaskConv2d.parameters(),
+                                            lr=hyp['lr0'],
+                                            momentum=hyp['momentum'])
+    hook_util = HookUtils()
+    handles = []
+
+    info = aux_util.layer_info[int(select_layer)]
+    in_channels = info['in_channels']
+    remove_k = math.floor(in_channels * pruned_rate)
+    k = in_channels - remove_k
+
+    for name, child in origin_model.module_list.named_children():
+        if name == select_layer:
+            handles.append(child.BatchNorm2d.register_forward_hook(hook_util.hook_origin_input))
+
+    aux_idx = aux_util.conv_layer_dict[select_layer]
+    hook_layer_aux = aux_util.down_sample_layer[aux_idx]
+    for name, child in prune_model.module_list.named_children():
+        if name == select_layer:
+            handles.append(child.BatchNorm2d.register_forward_hook(hook_util.hook_prune_input))
+        elif name == hook_layer_aux:
+            handles.append(child.register_forward_hook(hook_util.hook_prune_input))
+
+    aux_net = aux_util.creat_aux_list(416, device, conv_layer_name=select_layer)
+    chkpt_aux = torch.load(aux_weight, map_location=device)
+    aux_net.load_state_dict(chkpt_aux['aux{}'.format(aux_idx)])
+    del chkpt_aux
+
+    if device.type != 'cpu' and torch.cuda.device_count() > 1:
+        prune_model = torch.nn.parallel.DistributedDataParallel(prune_model, find_unused_parameters=True)
+        prune_model.yolo_layers = prune_model.module.yolo_layers
+        aux_net = torch.nn.parallel.DistributedDataParallel(aux_net, find_unused_parameters=True)
+
+    random_num = 100
+    prune_model.nc = 80
+    prune_model.hyp = hyp
+    prune_model.arc = 'default'
+    prune_model.eval()
+    aux_net.eval()
+    MSE = nn.MSELoss(reduction='mean')
+
+    random_greedy = torch.zeros(k)
+    for i_k in range(k):
+        pbar = tqdm(range(random_num), total=random_num)
+        print(('\n' + '%10s' * 8) % ('Stage', 'gpu_mem', 'iter', 'MSELoss', 'PdLoss', 'AuxLoss', 'Total', 'targets'))
+        data_iter = iter(data_loader)
+        for i in pbar:
+            imgs, targets, _, _ = data_iter.next()
+
+            if len(targets) == 0:
+                continue
+
+            imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
+            targets = targets.to(device)
+
+            with torch.no_grad():
+                _ = origin_model(imgs)
+
+            _, pruning_pred = prune_model(imgs)
+            pruning_loss, _ = compute_loss(pruning_pred, targets, prune_model)
+            hook_util.cat_to_gpu0('prune')
+
+            aux_pred = aux_net(hook_util.pruned_features['gpu0'][1])
+            aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
+
+            mse_loss = torch.zeros(1).to(device)
+            mse_loss += MSE(hook_util.pruned_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
+
+            loss = hyp['joint_loss'] * mse_loss + pruning_loss + aux_loss
+
+            loss.backward()
+
+            mem = torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0
+            s = ('%10s' * 3 + '%10.3g' * 5) % (
+                'Pruning ' + select_layer, '%.3gG' % mem, '%g/%g' % (i_k, k), mse_loss, pruning_loss, aux_loss, loss,
+                len(targets))
+            pbar.set_description(s)
+
+            hook_util.clean_hook_out('origin')
+            hook_util.clean_hook_out('prune')
+
+        grad = prune_model.module.module_list[int(select_layer)].MaskConv2d.weight.grad.detach() ** 2
+        grad = grad.sum((2, 3)).sqrt().sum(0)
+
+        if i_k == 0:
+            prune_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask[:] = 1e-5
+
+        selected_channels_mask = prune_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask
+        _, indices = torch.topk(grad * (1 - selected_channels_mask), 1)
+        prune_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask[indices] = 1
+        random_greedy[i_k] = indices
+        logger.info('random greedy layer{} iter{}: indices==>{}'.format(select_layer, str(i_k), str(indices)))
+
+        prune_model.zero_grad()
+
+        pbar = tqdm(range(random_num), total=random_num)
+        mloss = torch.zeros(4).to(device)
+        print(('\n' + '%10s' * 8) % ('Stage', 'gpu_mem', 'iter', 'MSELoss', 'PdLoss', 'AuxLoss', 'Total', 'targets'))
+        for i in pbar:
+
+            imgs, targets, _, _ = data_iter.next()
+
+            if len(targets) == 0:
+                continue
+
+            imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
+            targets = targets.to(device)
+
+            with torch.no_grad():
+                _ = origin_model(imgs)
+
+            _, pruning_pred = prune_model(imgs)
+            pruning_loss, _ = compute_loss(pruning_pred, targets, prune_model)
+            hook_util.cat_to_gpu0('prune')
+
+            aux_pred = aux_net(hook_util.pruned_features['gpu0'][1])
+            aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
+
+            mse_loss = torch.zeros(1).to(device)
+            mse_loss += MSE(hook_util.pruned_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
+
+            loss = hyp['joint_loss'] * mse_loss + pruning_loss + aux_loss
+
+            loss.backward()
+
+            solve_sub_problem_optimizer.step()
+            solve_sub_problem_optimizer.zero_grad()
+
+            mem = torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0
+            mloss = (mloss * i + torch.cat([mse_loss, pruning_loss, aux_loss, loss]).detach()) / (i + 1)
+            s = ('%10s' * 3 + '%10.3g' * 5) % (
+                'SubProm ' + select_layer, '%.3gG' % mem, '%g/%g' % (i_k, k), *mloss, len(targets))
+            pbar.set_description(s)
+
+            hook_util.clean_hook_out('origin')
+            hook_util.clean_hook_out('prune')
+
+    for handle in handles:
+        handle.remove()
+
+    logger.info(("random greedy layer{}: selected==>{}".format(select_layer, str(random_greedy))))
 
 
 def run_compare(cfg, data, prune_cfg, batch_size, origin_weights):
@@ -241,14 +376,10 @@ def run_compare(cfg, data, prune_cfg, batch_size, origin_weights):
     aux_util = AuxNetUtils(origin_model, hyp)
     del chkpt
 
-    init_state_dict = mask_converted(prune_cfg, origin_weights, target=None)
-
-    pruning_model = Darknet(prune_cfg).to(device)
-    pruning_model.load_state_dict(init_state_dict, strict=True)
-    del init_state_dict
-
     for layer in aux_util.pruning_layer[1:]:
-        compare_channel_select(origin_model, prune_cfg, layer, device, aux_util, train_loader, 0.95)
+        greedy_channel_select(origin_model, prune_cfg, origin_weights, layer, device, aux_util, train_loader, 0.75)
+        random_greedy_channel_select(origin_model, prune_cfg, origin_weights, layer, device, aux_util, train_loader,
+                                     0.75)
 
 
 if __name__ == "__main__":

@@ -196,7 +196,7 @@ def fine_tune(cfg, data, prune_cfg, aux_util, device, train_loader, test_loader,
 
             if need_aux_net:
                 hook_util.cat_to_gpu0(model='prune')
-                aux_pred = aux_net(hook_util.prune_features['gpu0'][0])
+                aux_pred = aux_net(hook_util.pruned_features['gpu0'][0])
                 aux_loss, aux_loss_items = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
                 aux_loss *= aux_loss_scalar * batch_size / 64
             else:
@@ -353,11 +353,11 @@ def channels_select(cfg, data, origin_model, prune_cfg, aux_util, device, data_l
         hook_util.cat_to_gpu0('prune')
 
         if need_aux_net:
-            aux_pred = aux_net(hook_util.prune_features['gpu0'][1])
+            aux_pred = aux_net(hook_util.pruned_features['gpu0'][1])
             aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
 
         mse_loss = torch.zeros(1).to(device)
-        mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
+        mse_loss += MSE(hook_util.pruned_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
 
         if need_aux_net:
             loss = hyp['joint_loss'] * mse_loss + pruning_loss + aux_loss
@@ -416,11 +416,11 @@ def channels_select(cfg, data, origin_model, prune_cfg, aux_util, device, data_l
         hook_util.cat_to_gpu0('prune')
 
         if need_aux_net:
-            aux_pred = aux_net(hook_util.prune_features['gpu0'][1])
+            aux_pred = aux_net(hook_util.pruned_features['gpu0'][1])
             aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
 
         mse_loss = torch.zeros(1).to(device)
-        mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
+        mse_loss += MSE(hook_util.pruned_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
 
         if need_aux_net:
             loss = hyp['joint_loss'] * mse_loss + pruning_loss + aux_loss
