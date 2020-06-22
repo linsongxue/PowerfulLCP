@@ -607,7 +607,7 @@ def pruning(mask_cfg, progress_weights, aux_util):
 
     route_layer = ['37', '62']
     route_mask = [None, None]
-    for layer in aux_util.pruning_layer:
+    for layer in aux_util.pruning_layer[::-1]:
         assert isinstance(model.module_list[int(layer)][0], MaskConv2d), "Not a pruned model!"
         in_channels_mask = model.module_list[int(layer)][0].selected_channels_mask
         out_channels_mask = torch.ones(model.module_list[int(layer)][0].out_channels)

@@ -88,32 +88,32 @@ class AuxNet(nn.Module):
 
         # Layer 1
         self.layer_1 = nn.Sequential()
-        self.layer_1.add_module("CBAMConv2d", CBAMModule(in_channels=128,
-                                                         out_channels=256,
-                                                         kernel_size=3,
-                                                         stride=1,
-                                                         padding=1,
-                                                         deepwidth=True))
+        self.layer_1.add_module("CBAM", CBAMModule(in_channels=128,
+                                                   out_channels=256,
+                                                   kernel_size=3,
+                                                   stride=1,
+                                                   padding=1,
+                                                   deepwidth=True))
         self.layer_1.add_module("activation", nn.LeakyReLU(0.1, inplace=True))
 
         # Layer 2
         self.layer_2 = nn.Sequential()
-        self.layer_2.add_module("CBAMConv2d", CBAMModule(in_channels=256,
-                                                         out_channels=256,
-                                                         kernel_size=1,
-                                                         stride=1,
-                                                         padding=0,
-                                                         deepwidth=False))
+        self.layer_2.add_module("CBAM", CBAMModule(in_channels=256,
+                                                   out_channels=256,
+                                                   kernel_size=1,
+                                                   stride=1,
+                                                   padding=0,
+                                                   deepwidth=False))
         self.layer_2.add_module("activation", nn.LeakyReLU(0.1, inplace=True))
 
         # Layer 3
         self.layer_3 = nn.Sequential()
-        self.layer_3.add_module("CBAMConv2d", CBAMModule(in_channels=256,
-                                                         out_channels=256,
-                                                         kernel_size=3,
-                                                         stride=1,
-                                                         padding=1,
-                                                         deepwidth=True))
+        self.layer_3.add_module("CBAM", CBAMModule(in_channels=256,
+                                                   out_channels=256,
+                                                   kernel_size=3,
+                                                   stride=1,
+                                                   padding=1,
+                                                   deepwidth=True))
         self.layer_3.add_module("activation", nn.LeakyReLU(0.1, inplace=True))
 
         # Layer 4
@@ -135,7 +135,7 @@ class AuxNet(nn.Module):
         :return:
         """
 
-        if input2:
+        if input2 is not None:
             input1 = F.interpolate(input1, (self.feature_maps_size, self.feature_maps_size), mode='bilinear',
                                    align_corners=False)
             input2 = F.interpolate(input2, (self.feature_maps_size, self.feature_maps_size), mode='bilinear',
@@ -279,9 +279,16 @@ class AuxNetUtils(object):
     def state(self):
         return self.prune_guide
 
+    def next_prune_layer(self, layer):
+        idx = self.pruning_layer.index(layer)
+        try:
+            return self.pruning_layer[idx + 1]
+        except IndexError:
+            return 'end'
+
     def creat_aux_model(self, layer_name, img_size, feature_maps_size=52):
         if isinstance(layer_name, str):
-            aux_model = AuxNet(self.layer_info[int(layer_name)]['out_channels'],
+            aux_model = AuxNet(self.layer_info[layer_name]['out_channels'],
                                self.num_classes,
                                self.hyp,
                                self.anchors,
@@ -290,7 +297,7 @@ class AuxNetUtils(object):
             return aux_model
 
         elif isinstance(layer_name, list):
-            in_channels = sum([self.layer_info[int(x)]['out_channels'] for x in layer_name])
+            in_channels = sum([self.layer_info[x]['out_channels'] for x in layer_name])
             aux_model = AuxNet(in_channels,
                                self.num_classes,
                                self.hyp,
@@ -342,7 +349,7 @@ def compute_loss_for_aux(output, targets, aux_model):
     hyp = aux_model.hyp
     ft = torch.cuda.FloatTensor if output.is_cuda else torch.Tensor
     BCEcls = nn.BCEWithLogitsLoss(pos_weight=ft([hyp['cls_pw']]), reduction='sum')
-    txy, twh, tcls, tbox, index, anchors_vec = AuxNetUtils.build_targets_for_aux(aux_model, targets)
+    txy, twh, tcls, tbox, index, anchors_vec = build_targets_for_aux(aux_model, targets)
     b, a, j, i = index
     nb = len(b)
     if nb:
@@ -374,37 +381,38 @@ class HookUtils(object):
 
     def __init__(self):
         self.origin_features = {}
-        self.pruned_features = {}
+        self.prune_features = {}
         for i in range(torch.cuda.device_count()):
             self.origin_features['gpu{}'.format(i)] = []
-            self.pruned_features['gpu{}'.format(i)] = []
+            self.prune_features['gpu{}'.format(i)] = []
 
     def hook_origin_output(self, module, input, output):
         self.origin_features['gpu{}'.format(output.device.index)].append(output)
 
     def hook_prune_output(self, module, input, output):
-        self.pruned_features['gpu{}'.format(output.device.index)].append(output)
+        self.prune_features['gpu{}'.format(output.device.index)].append(output)
 
     def cat_to_gpu0(self):
         device_list = list(self.origin_features.keys())
-        assert self.origin_features['gpu0'] and self.pruned_features['gpu0'], "Did not get hook features!"
+        assert self.origin_features['gpu0'] or self.prune_features['gpu0'], "Did not get hook features!"
         for device in device_list[1:]:
             for i in range(len(self.origin_features['gpu0'])):
                 self.origin_features['gpu0'][i] = torch.cat(
                     [self.origin_features['gpu0'][i], self.origin_features[device][i].cuda(0)], dim=0)
-            for i in range(len(self.pruned_features['gpu0'])):
-                self.pruned_features['gpu0'][i] = torch.cat(
-                    [self.pruned_features['gpu0'][i], self.pruned_features[device][i].cuda(0)], dim=0)
+            for i in range(len(self.prune_features['gpu0'])):
+                self.prune_features['gpu0'][i] = torch.cat(
+                    [self.prune_features['gpu0'][i], self.prune_features[device][i].cuda(0)], dim=0)
 
     def clean_hook_out(self):
         for key in list(self.origin_features.keys()):
             self.origin_features[key] = []
-        for key in list(self.pruned_features.keys()):
-            self.pruned_features[key] = []
+        for key in list(self.prune_features.keys()):
+            self.prune_features[key] = []
 
 
-def train_for_aux(cfg, data, weights, aux_weight, batch_size, img_size, hyp, device, resume, epochs):
+def train_for_aux(cfg, data_loader, weights, aux_weight, img_size, hyp, device, resume, epochs):
     init_seeds()
+    batch_size = data_loader.batch_size
     accumulate = 64 // batch_size
 
     model = Darknet(cfg).to(device)
@@ -414,8 +422,6 @@ def train_for_aux(cfg, data, weights, aux_weight, batch_size, img_size, hyp, dev
     aux_util = AuxNetUtils(model, hyp)
     hook_util = HookUtils()
 
-    data_dict = parse_data_cfg(data)
-    train_path = data_dict['train']
     start_epoch = 0
 
     aux_model_list = []
@@ -459,36 +465,18 @@ def train_for_aux(cfg, data, weights, aux_weight, batch_size, img_size, hyp, dev
             handles.append(child.register_forward_hook(hook_util.hook_origin_output))
 
     if device.type != 'cpu' and torch.cuda.device_count() > 1:
-        for i, aux_model in aux_model_list:
+        for i, aux_model in enumerate(aux_model_list):
             aux_model_list[i] = nn.parallel.DistributedDataParallel(aux_model, find_unused_parameters=True)
 
         model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         model.yolo_layers = model.module.yolo_layers
 
-    # data loader
-    dataset = LoadImagesAndLabels(train_path, img_size, batch_size,
-                                  augment=True,
-                                  hyp=hyp,  # augmentation hyperparameters
-                                  rect=False,  # rectangular training
-                                  cache_labels=True,
-                                  cache_images=False)
-
-    batch_size = min(batch_size, len(dataset))
-    nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])  # number of workers
-    dataloader = torch.utils.data.DataLoader(dataset,
-                                             batch_size=batch_size,
-                                             num_workers=nw,
-                                             shuffle=True,  # Shuffle=True unless rectangular training is used
-                                             pin_memory=True,
-                                             collate_fn=dataset.collate_fn)
-
-    nb = len(dataloader)
+    nb = len(data_loader)
     model.nc = 80
     model.hyp = aux_util.hyp
     model.arc = 'default'
     for aux_model in aux_model_list:
         model_info(aux_model, report='summary')
-    print('Using %g dataloader workers' % nw)
     print('Starting training for %g epochs...' % epochs)
     for epoch in range(start_epoch, epochs):
 
@@ -497,7 +485,7 @@ def train_for_aux(cfg, data, weights, aux_weight, batch_size, img_size, hyp, dev
         print(('\n' + '%10s' * 8) % ('Stage', 'Epoch', 'gpu_mem', 'AuxID', 'DIoU', 'cls', 'total', 'targets'))
 
         # -----------------start batch-----------------
-        pbar = tqdm(enumerate(dataloader), total=nb)
+        pbar = tqdm(enumerate(data_loader), total=nb)
         for i, (imgs, targets, _, _) in pbar:
 
             if len(targets) == 0:
@@ -548,6 +536,7 @@ def train_for_aux(cfg, data, weights, aux_weight, batch_size, img_size, hyp, dev
                 chkpt['aux_in{}'.format(layer[0])] = aux_model_list[i].module.state_dict() if type(
                     aux_model_list[i]) is nn.parallel.DistributedDataParallel else aux_model_list[i].state_dict()
         torch.save(chkpt, aux_weight)
+        torch.save(chkpt, "../weights/aux-voc.pt")
         del chkpt
 
         with open("aux_result.txt", 'a') as f:
@@ -618,4 +607,4 @@ def mask_cfg_and_converted(mask_replace_layer,
                  'optimizer': None}
         torch.save(chkpt, target)
 
-    return model.state_dict()
+    return mask_cfg, model.state_dict()

@@ -110,11 +110,11 @@ def greedy_channel_select(origin_model, prune_cfg, origin_weights, select_layer,
             pruning_loss, _ = compute_loss(pruning_pred, targets, prune_model)
             hook_util.cat_to_gpu0('prune')
 
-            aux_pred = aux_net(hook_util.pruned_features['gpu0'][1])
+            aux_pred = aux_net(hook_util.prune_features['gpu0'][1])
             aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
 
             mse_loss = torch.zeros(1).to(device)
-            mse_loss += MSE(hook_util.pruned_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
+            mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
 
             loss = hyp['joint_loss'] * mse_loss + pruning_loss + aux_loss
 
@@ -163,11 +163,11 @@ def greedy_channel_select(origin_model, prune_cfg, origin_weights, select_layer,
             pruning_loss, _ = compute_loss(pruning_pred, targets, prune_model)
             hook_util.cat_to_gpu0('prune')
 
-            aux_pred = aux_net(hook_util.pruned_features['gpu0'][1])
+            aux_pred = aux_net(hook_util.prune_features['gpu0'][1])
             aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
 
             mse_loss = torch.zeros(1).to(device)
-            mse_loss += MSE(hook_util.pruned_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
+            mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
 
             loss = hyp['joint_loss'] * mse_loss + pruning_loss + aux_loss
 
@@ -260,11 +260,11 @@ def random_greedy_channel_select(origin_model, prune_cfg, origin_weights, select
             pruning_loss, _ = compute_loss(pruning_pred, targets, prune_model)
             hook_util.cat_to_gpu0('prune')
 
-            aux_pred = aux_net(hook_util.pruned_features['gpu0'][1])
+            aux_pred = aux_net(hook_util.prune_features['gpu0'][1])
             aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
 
             mse_loss = torch.zeros(1).to(device)
-            mse_loss += MSE(hook_util.pruned_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
+            mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
 
             loss = hyp['joint_loss'] * mse_loss + pruning_loss + aux_loss
 
@@ -313,11 +313,11 @@ def random_greedy_channel_select(origin_model, prune_cfg, origin_weights, select
             pruning_loss, _ = compute_loss(pruning_pred, targets, prune_model)
             hook_util.cat_to_gpu0('prune')
 
-            aux_pred = aux_net(hook_util.pruned_features['gpu0'][1])
+            aux_pred = aux_net(hook_util.prune_features['gpu0'][1])
             aux_loss, _ = AuxNetUtils.compute_loss_for_aux(aux_pred, aux_net, targets)
 
             mse_loss = torch.zeros(1).to(device)
-            mse_loss += MSE(hook_util.pruned_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
+            mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
 
             loss = hyp['joint_loss'] * mse_loss + pruning_loss + aux_loss
 
@@ -376,7 +376,7 @@ def run_compare(cfg, data, prune_cfg, batch_size, origin_weights):
     aux_util = AuxNetUtils(origin_model, hyp)
     del chkpt
 
-    for layer in aux_util.pruning_layer[1:]:
+    for layer in aux_util.pruning_layer[7:]:
         greedy_channel_select(origin_model, prune_cfg, origin_weights, layer, device, aux_util, train_loader, 0.75)
         random_greedy_channel_select(origin_model, prune_cfg, origin_weights, layer, device, aux_util, train_loader,
                                      0.75)
