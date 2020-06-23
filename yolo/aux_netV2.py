@@ -259,7 +259,7 @@ class AuxNetUtils(object):
             sample_layer = self.prune_guide[layer]['tail_link']
             if not self.prune_guide[sample_layer]['pruned']:
                 raise Exception
-            if self.prune_guide[sample_layer]['base_channels'] == self.prune_guide[sample_layer]['retain_channels']:
+            if self.prune_guide[sample_layer]['prun'] == self.prune_guide[sample_layer]['retain_channels']:
                 raise Exception
             retain_channels = self.prune_guide[sample_layer]['retain_channels']
             self.prune_guide[layer]['retain_channels'] = retain_channels
