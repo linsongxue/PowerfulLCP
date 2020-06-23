@@ -5,6 +5,7 @@ import math
 from tqdm import tqdm
 import numpy as np
 import time
+import traceback
 
 import torch
 import torch.nn as nn
@@ -21,6 +22,7 @@ from utils.torch_utils import select_device
 from utils.parse_config import parse_data_cfg, parse_model_cfg
 from aux_netV2 import AuxNetUtils, HookUtils, mask_cfg_and_converted, compute_loss_for_aux, train_for_aux
 import logging
+from email_error import send_error_report
 
 hyp = {'diou': 3.5,  # giou loss gain
        'giou': 3.5,
@@ -80,10 +82,11 @@ def fine_tune(prune_cfg, data, aux_util, device, train_loader, test_loader, epoc
         aux_loss_scalar = max(0.01, pow((int(aux_in_layer[0]) + 1) / 75, 2))
 
     start_epoch = chkpt['epoch'] + 1
-    if start_epoch == epochs:
-        return current_layer  # fine tune 完毕，返回需要修剪的层名
 
     aux_util.load_state(chkpt['prune_guide'])
+
+    if start_epoch == epochs:
+        return current_layer  # fine tune 完毕，返回需要修剪的层名
 
     pg0, pg1 = [], []  # optimizer parameter groups
     for k, v in dict(pruned_model.named_parameters()).items():
@@ -269,7 +272,6 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
         aux_loss_scalar = max(0.01, pow((int(aux_in_layer[0]) + 1) / 75, 2))
 
     aux_util.load_state(chkpt['prune_guide'])
-
     del chkpt
 
     for name, child in origin_model.module_list.named_children():
@@ -280,9 +282,9 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
 
     for name, child in pruning_model.module_list.named_children():
         if isinstance(aux_in_layer, str) and name == aux_in_layer:
-            handles.append(child.register_forward_hook(hook_util.hook_origin_output))
+            handles.append(child.register_forward_hook(hook_util.hook_prune_output))
         elif isinstance(aux_in_layer, list) and name in aux_in_layer:
-            handles.append(child.register_forward_hook(hook_util.hook_origin_output))
+            handles.append(child.register_forward_hook(hook_util.hook_prune_output))
 
     if device.type != 'cpu' and torch.cuda.device_count() > 1:
         origin_model = torch.nn.parallel.DistributedDataParallel(origin_model, find_unused_parameters=True)
@@ -300,7 +302,6 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
     MSE = nn.MSELoss(reduction='mean')
     mloss = torch.zeros(4).to(device)
 
-    greedy_indices = torch.zeros(aux_util.prune_guide[select_layer]['base_channels'], device=device)
     for i_k in range(retain_channels_num):
 
         data_iter = iter(data_loader)
@@ -325,11 +326,11 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
             hook_util.cat_to_gpu0()
             if isinstance(aux_in_layer, str):
                 aux_pred = aux_model(hook_util.prune_features['gpu0'][0])
-                aux_loss = compute_loss_for_aux(aux_pred, targets, aux_model)
+                aux_loss, _ = compute_loss_for_aux(aux_pred, targets, aux_model)
                 mse_loss = MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
             else:
                 aux_pred = aux_model(hook_util.prune_features['gpu0'][0], hook_util.prune_features['gpu0'][1])
-                aux_loss = compute_loss_for_aux(aux_pred, targets, aux_model)
+                aux_loss, _ = compute_loss_for_aux(aux_pred, targets, aux_model)
                 mse_loss = MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0]) + MSE(
                     hook_util.prune_features['gpu0'][1], hook_util.origin_features['gpu0'][1])
                 mse_loss /= 2.0
@@ -363,7 +364,6 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
 
         selected_channels_mask = pruning_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask
         _, indices = torch.topk(grad * (1 - selected_channels_mask), 1)
-        greedy_indices[indices] = 1
 
         pruning_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask[indices] = 1
         if 'sync' in aux_util.prune_guide[select_layer].keys():
@@ -393,11 +393,11 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
             hook_util.cat_to_gpu0()
             if isinstance(aux_in_layer, str):
                 aux_pred = aux_model(hook_util.prune_features['gpu0'][0])
-                aux_loss = compute_loss_for_aux(aux_pred, targets, aux_model)
+                aux_loss, _ = compute_loss_for_aux(aux_pred, targets, aux_model)
                 mse_loss = MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
             else:
                 aux_pred = aux_model(hook_util.prune_features['gpu0'][0], hook_util.prune_features['gpu0'][1])
-                aux_loss = compute_loss_for_aux(aux_pred, targets, aux_model)
+                aux_loss, _ = compute_loss_for_aux(aux_pred, targets, aux_model)
                 mse_loss = MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0]) + MSE(
                     hook_util.prune_features['gpu0'][1], hook_util.origin_features['gpu0'][1])
                 mse_loss /= 2.0
@@ -426,7 +426,8 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
     for handle in handles:
         handle.remove()
 
-    pruning_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask *= greedy_indices
+    greedy_indices = pruning_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask < 1
+    pruning_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask[greedy_indices] = 0
 
     res, _ = test.test(prune_cfg,
                        data,
@@ -556,7 +557,7 @@ if __name__ == '__main__':
     parser.add_argument('--start_layer', type=str, default='75')
     parser.add_argument('--aux-epochs', type=int, default=50)
     parser.add_argument('--ft-epochs', type=int, default=15)
-    parser.add_argument('--batch-size', type=int, default=64)  # effective bs = batch_size * accumulate = 16 * 4 = 64
+    parser.add_argument('--batch-size', type=int, default=32)  # effective bs = batch_size * accumulate = 16 * 4 = 64
     parser.add_argument('--cfg', type=str, default='cfg/yolov3-voc.cfg', help='*.cfg path')
     parser.add_argument('--weights', type=str, default='../weights/converted-voc.pt', help='initial weights')
     parser.add_argument('--data', type=str, default='data/voc.data', help='*.data path')
@@ -574,14 +575,17 @@ if __name__ == '__main__':
                                 world_size=1,  # number of nodes for distributed training
                                 rank=0)  # distributed training node rank
 
-    mask_cfg, aux_util = get_thin_model(cfg=opt.cfg,
-                                        data=opt.data,
-                                        origin_weights=opt.weights,
-                                        img_size=opt.img_size,
-                                        batch_size=opt.batch_size,
-                                        prune_rate=opt.prune_rate,
-                                        aux_epochs=opt.aux_epochs,
-                                        ft_epochs=opt.ft_epochs,
-                                        resume=opt.resume,
-                                        cache_images=opt.cache_images,
-                                        start_layer=opt.start_layer)
+    try:
+        mask_cfg, aux_util = get_thin_model(cfg=opt.cfg,
+                                            data=opt.data,
+                                            origin_weights=opt.weights,
+                                            img_size=opt.img_size,
+                                            batch_size=opt.batch_size,
+                                            prune_rate=opt.prune_rate,
+                                            aux_epochs=opt.aux_epochs,
+                                            ft_epochs=opt.ft_epochs,
+                                            resume=opt.resume,
+                                            cache_images=opt.cache_images,
+                                            start_layer=opt.start_layer)
+    except Exception:
+        send_error_report(str(traceback.format_exc()))
