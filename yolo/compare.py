@@ -231,7 +231,7 @@ def random_greedy_channel_select(origin_model, prune_cfg, origin_weights, select
         prune_model.yolo_layers = prune_model.module.yolo_layers
         aux_net = torch.nn.parallel.DistributedDataParallel(aux_net, find_unused_parameters=True)
 
-    random_num = 100
+    random_num = 50
     prune_model.nc = 80
     prune_model.hyp = hyp
     prune_model.arc = 'default'
@@ -376,8 +376,8 @@ def run_compare(cfg, data, prune_cfg, batch_size, origin_weights):
     aux_util = AuxNetUtils(origin_model, hyp)
     del chkpt
 
-    for layer in aux_util.pruning_layer[7:]:
-        greedy_channel_select(origin_model, prune_cfg, origin_weights, layer, device, aux_util, train_loader, 0.75)
+    for layer in aux_util.pruning_layer[1:]:
+        # greedy_channel_select(origin_model, prune_cfg, origin_weights, layer, device, aux_util, train_loader, 0.75)
         random_greedy_channel_select(origin_model, prune_cfg, origin_weights, layer, device, aux_util, train_loader,
                                      0.75)
 

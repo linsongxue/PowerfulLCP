@@ -6,6 +6,7 @@ from tqdm import tqdm
 import numpy as np
 import time
 import traceback
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -20,7 +21,7 @@ from utils.datasets import LoadImagesAndLabels
 from utils.utils import compute_loss, init_seeds
 from utils.torch_utils import select_device
 from utils.parse_config import parse_data_cfg, parse_model_cfg
-from aux_netV2 import AuxNetUtils, HookUtils, mask_cfg_and_converted, compute_loss_for_aux, train_for_aux
+from aux_netV2 import AuxNetUtils, HookUtils, mask_cfg_and_converted, compute_loss_for_aux, train_for_aux, write_cfg
 import logging
 from email_error import send_error_report
 
@@ -257,10 +258,6 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
     chkpt = torch.load(progress_chkpt, map_location=device)
     pruning_model.load_state_dict(chkpt['model'], strict=True)
 
-    solve_sub_problem_optimizer = optim.SGD(pruning_model.module_list[int(select_layer)].MaskConv2d.parameters(),
-                                            lr=hyp['lr0'],
-                                            momentum=hyp['momentum'])
-
     aux_in_layer = aux_util.conv_layer_dict[select_layer]
     aux_model = aux_util.creat_aux_model(aux_in_layer, img_size)
     aux_model.to(device)
@@ -273,6 +270,17 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
 
     aux_util.load_state(chkpt['prune_guide'])
     del chkpt
+
+    if isinstance(aux_in_layer, str):
+        solve_sub_problem_optimizer = optim.SGD(pruning_model.module_list[int(aux_in_layer)].MaskConv2d.parameters(),
+                                                lr=hyp['lr0'],
+                                                momentum=hyp['momentum'])
+    else:
+        solve_sub_problem_optimizer = optim.SGD(pruning_model.module_list[int(aux_in_layer[0])].MaskConv2d.parameters(),
+                                                lr=hyp['lr0'],
+                                                momentum=hyp['momentum'])
+        solve_sub_problem_optimizer.add_param_group(
+            {'params': pruning_model.module_list[int(aux_in_layer[1])].MaskConv2d.parameters()})
 
     for name, child in origin_model.module_list.named_children():
         if isinstance(aux_in_layer, str) and name == aux_in_layer:
@@ -324,14 +332,15 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
             pruning_loss, _ = compute_loss(pruning_pred, targets, pruning_model)
 
             hook_util.cat_to_gpu0()
+            mse_loss = torch.zeros(1, device=device)
             if isinstance(aux_in_layer, str):
                 aux_pred = aux_model(hook_util.prune_features['gpu0'][0])
                 aux_loss, _ = compute_loss_for_aux(aux_pred, targets, aux_model)
-                mse_loss = MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
+                mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
             else:
                 aux_pred = aux_model(hook_util.prune_features['gpu0'][0], hook_util.prune_features['gpu0'][1])
                 aux_loss, _ = compute_loss_for_aux(aux_pred, targets, aux_model)
-                mse_loss = MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0]) + MSE(
+                mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0]) + MSE(
                     hook_util.prune_features['gpu0'][1], hook_util.origin_features['gpu0'][1])
                 mse_loss /= 2.0
 
@@ -391,14 +400,15 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
             pruning_loss, _ = compute_loss(pruning_pred, targets, pruning_model)
 
             hook_util.cat_to_gpu0()
+            mse_loss = torch.zeros(1, device=device)
             if isinstance(aux_in_layer, str):
                 aux_pred = aux_model(hook_util.prune_features['gpu0'][0])
                 aux_loss, _ = compute_loss_for_aux(aux_pred, targets, aux_model)
-                mse_loss = MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
+                mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
             else:
                 aux_pred = aux_model(hook_util.prune_features['gpu0'][0], hook_util.prune_features['gpu0'][1])
                 aux_loss, _ = compute_loss_for_aux(aux_pred, targets, aux_model)
-                mse_loss = MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0]) + MSE(
+                mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0]) + MSE(
                     hook_util.prune_features['gpu0'][1], hook_util.origin_features['gpu0'][1])
                 mse_loss /= 2.0
 
@@ -549,6 +559,80 @@ def get_thin_model(cfg, data, origin_weights, img_size, batch_size, prune_rate, 
         channels_select(mask_cfg, data, origin_model, aux_util, device, train_loader, layer, prune_rate)
 
     return mask_cfg, aux_util
+
+
+def prune(mask_cfg, progress_weights, mask_replace_layer):
+    only_in = mask_replace_layer[-3:]
+    mask_replace_layer = mask_replace_layer[: -2]
+
+    device_in = torch.device('cpu')
+    model = Darknet(mask_cfg)
+    chkpt = torch.load(progress_weights, map_location=device_in)
+    model.load_state_dict(chkpt['model'])
+
+    new_cfg = parse_model_cfg(mask_cfg)
+
+    for layer in mask_replace_layer[:-1]:
+        assert isinstance(model.module_list[int(layer)][0], MaskConv2d), "Not a pruned model!"
+        tail_layer = mask_replace_layer[mask_replace_layer.index(layer) + 1]
+        assert isinstance(model.module_list[int(tail_layer)][0], MaskConv2d), "Not a pruned model!"
+        in_channels_mask = model.module_list[int(layer)][0].selected_channels_mask
+        out_channels_mask = model.module_list[int(tail_layer)][0].selected_channels_mask
+
+        in_channels = int(torch.sum(in_channels_mask))
+        out_channels = int(torch.sum(out_channels_mask))
+
+        new_cfg[int(layer) + 1]['type'] = 'convolutional'
+        new_cfg[int(layer) + 1]['filters'] = str(out_channels)
+
+        new_conv = nn.Conv2d(in_channels,
+                             out_channels,
+                             kernel_size=model.module_list[int(layer)][0].kernel_size,
+                             stride=model.module_list[int(layer)][0].stride,
+                             padding=model.module_list[int(layer)][0].padding,
+                             bias=False)
+        thin_weight = model.module_list[int(layer)][0].weight[out_channels_mask.bool()]
+        thin_weight = thin_weight[:, in_channels_mask.bool()]
+        assert new_conv.weight.numel() == thin_weight.numel(), 'Do not match in shape!'
+        new_conv.weight.data.copy_(thin_weight.data)
+
+        new_batch = nn.BatchNorm2d(out_channels, momentum=0.1)
+        new_batch.weight.data.copy_(model.module_list[int(layer)][1].weight[out_channels_mask.bool()].data)
+        new_batch.bias.data.copy_(model.module_list[int(layer)][1].bias[out_channels_mask.bool()].data)
+        new_batch.running_mean.copy_(model.module_list[int(layer)][1].running_mean[out_channels_mask.bool()].data)
+        new_batch.running_var.copy_(model.module_list[int(layer)][1].running_var[out_channels_mask.bool()].data)
+        new_module = nn.Sequential()
+        new_module.add_module('Conv2d', new_conv)
+        new_module.add_module('BatchNorm2d', new_batch)
+        new_module.add_module('activation', model.module_list[int(layer)][2])
+        model.module_list[int(layer)] = new_module
+
+    for layer in only_in:
+        assert isinstance(model.module_list[int(layer)][0], MaskConv2d), "Not a pruned model!"
+        in_channels_mask = model.module_list[int(layer)][0].selected_channels_mask
+        in_channels = int(torch.sum(in_channels_mask))
+
+        new_conv = nn.Conv2d(in_channels,
+                             out_channels=model.module_list[int(layer)][0].out_channels,
+                             kernel_size=model.module_list[int(layer)][0].kernel_size,
+                             stride=model.module_list[int(layer)][0].stride,
+                             padding=model.module_list[int(layer)][0].padding,
+                             bias=False)
+        new_conv.weight.data.copy_(model.module_list[int(layer)][0].weight[:, in_channels_mask.bool()].data)
+
+        new_module = nn.Sequential()
+        new_module.add_module('Conv2d', new_conv)
+        new_module.add_module('BatchNorm2d', model.module_list[int(layer)][1])
+        new_module.add_module('activation', model.module_list[int(layer)][2])
+        model.module_list[int(layer)] = new_module
+
+    write_cfg('cfg/pruned-yolov3.cfg', new_cfg)
+    chkpt = {'epoch': -1,
+             'best_fitness': None,
+             'training_results': None,
+             'model': model.state_dict(),
+             'optimizer': None}
+    torch.save(chkpt, '../weights/pruned-converted.pt')
 
 
 if __name__ == '__main__':
