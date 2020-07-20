@@ -7,14 +7,11 @@ import torch.optim.lr_scheduler as lr_scheduler
 import torch.optim as optim
 from models import Darknet
 from utils.utils import wh_iou, bbox_iou
-from utils.parse_config import parse_model_cfg, parse_data_cfg
+from utils.parse_config import parse_model_cfg
 from utils.torch_utils import init_seeds, model_info
-from utils.datasets import LoadImagesAndLabels
 from tqdm import tqdm
 from collections import OrderedDict
 import math
-import os.path as path
-import os
 
 
 class HeadLayer(nn.Module):
@@ -251,27 +248,34 @@ class AuxNetUtils(object):
         self.prune_guide['37']['sync'] = '99'
         self.prune_guide['62']['sync'] = '87'
 
+        self.pruning_layer = self.pruning_layer[::-1]
+
     def compute_retain_channels(self, layer, rate):
         if self.prune_guide[layer]['pruned']:
             raise Exception
 
-        if 'tail_link' in self.prune_guide[layer].keys():
-            sample_layer = self.prune_guide[layer]['tail_link']
-            if not self.prune_guide[sample_layer]['pruned']:
-                raise Exception
-            if self.prune_guide[sample_layer]['prun'] == self.prune_guide[sample_layer]['retain_channels']:
-                raise Exception
-            retain_channels = self.prune_guide[sample_layer]['retain_channels']
-            self.prune_guide[layer]['retain_channels'] = retain_channels
-            self.prune_guide[layer]['pruned'] = True
+        # if 'tail_link' in self.prune_guide[layer].keys():
+        #     sample_layer = self.prune_guide[layer]['tail_link']
+        #     if not self.prune_guide[sample_layer]['pruned']:
+        #         raise Exception
+        #     if self.prune_guide[sample_layer]['base_channels'] == self.prune_guide[sample_layer]['retain_channels']:
+        #         raise Exception
+        #     retain_channels = self.prune_guide[sample_layer]['retain_channels']
+        #     self.prune_guide[layer]['retain_channels'] = retain_channels
+        #     self.prune_guide[layer]['pruned'] = True
+        #
+        #     return self.prune_guide[layer]['retain_channels']
+        #
+        # else:
+        #     self.prune_guide[layer]['retain_channels'] = math.floor(
+        #         self.prune_guide[layer]['base_channels'] * (1 - rate))
+        #     self.prune_guide[layer]['pruned'] = True
+        #     return self.prune_guide[layer]['retain_channels']
 
-            return self.prune_guide[layer]['retain_channels']
-
-        else:
-            self.prune_guide[layer]['retain_channels'] = math.floor(
-                self.prune_guide[layer]['base_channels'] * (1 - rate))
-            self.prune_guide[layer]['pruned'] = True
-            return self.prune_guide[layer]['retain_channels']
+        self.prune_guide[layer]['retain_channels'] = math.floor(
+            self.prune_guide[layer]['base_channels'] * (1 - rate))
+        self.prune_guide[layer]['pruned'] = True
+        return self.prune_guide[layer]['retain_channels']
 
     def load_state(self, prune_guide):
         self.prune_guide = prune_guide

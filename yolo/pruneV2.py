@@ -36,7 +36,7 @@ hyp = {'diou': 3.5,  # giou loss gain
        'lrf': -4.,  # final LambdaLR learning rate = lr0 * (10 ** lrf)
        'momentum': 0.9,  # SGD momentum
        'weight_decay': 0.0005,  # optimizer weight decay
-       'joint_loss': 1.0,
+       'joint_loss': 20,
        'fl_gamma': 0.5,  # focal loss gamma
        'hsv_h': 0.0138,  # image HSV-Hue augmentation (fraction)
        'hsv_s': 0.678,  # image HSV-Saturation augmentation (fraction)
@@ -252,7 +252,7 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
     accumulate = 64 // batch_size
     hook_util = HookUtils()
     handles = []
-    n_iter = 100
+    n_iter = 15
 
     pruning_model = Darknet(prune_cfg, img_size=(img_size, img_size)).to(device)
     chkpt = torch.load(progress_chkpt, map_location=device)
@@ -554,7 +554,7 @@ def get_thin_model(cfg, data, origin_weights, img_size, batch_size, prune_rate, 
     if start_layer == aux_util.pruning_layer[-1]:
         return mask_cfg, aux_util
 
-    while int(layer) > int(aux_util.pruning_layer[-1]):
+    while int(layer) < int(aux_util.pruning_layer[-1]):
         layer = fine_tune(mask_cfg, data, aux_util, device, train_loader, test_loader, ft_epochs)
         channels_select(mask_cfg, data, origin_model, aux_util, device, train_loader, layer, prune_rate)
 
@@ -608,8 +608,9 @@ def prune(mask_cfg, progress_weights, mask_replace_layer):
         model.module_list[int(layer)] = new_module
 
     for layer in only_in:
+        new_cfg[int(layer) + 1]['type'] = 'convolutional'
         assert isinstance(model.module_list[int(layer)][0], MaskConv2d), "Not a pruned model!"
-        in_channels_mask = model.module_list[int(layer)][0].selected_channels_mask
+        in_channels_mask = model.module_list[int(layer)][0].selected_channels_mask > 0.1
         in_channels = int(torch.sum(in_channels_mask))
 
         new_conv = nn.Conv2d(in_channels,
@@ -626,19 +627,19 @@ def prune(mask_cfg, progress_weights, mask_replace_layer):
         new_module.add_module('activation', model.module_list[int(layer)][2])
         model.module_list[int(layer)] = new_module
 
-    write_cfg('cfg/pruned-yolov3.cfg', new_cfg)
+    write_cfg('cfg/pruned-yolov3-voc.cfg', new_cfg)
     chkpt = {'epoch': -1,
              'best_fitness': None,
              'training_results': None,
              'model': model.state_dict(),
              'optimizer': None}
-    torch.save(chkpt, '../weights/pruned-converted.pt')
+    torch.save(chkpt, '../weights/pruned-converted-voc.pt')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--prune-rate', type=float, default=0.7)
-    parser.add_argument('--start_layer', type=str, default='75')
+    parser.add_argument('--start_layer', type=str, default='1')
     parser.add_argument('--aux-epochs', type=int, default=50)
     parser.add_argument('--ft-epochs', type=int, default=15)
     parser.add_argument('--batch-size', type=int, default=32)  # effective bs = batch_size * accumulate = 16 * 4 = 64
@@ -673,3 +674,5 @@ if __name__ == '__main__':
                                             start_layer=opt.start_layer)
     except Exception:
         send_error_report(str(traceback.format_exc()))
+
+    dist.destroy_process_group() if torch.cuda.device_count() > 1 else None

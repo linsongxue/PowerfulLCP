@@ -924,7 +924,7 @@ def prune(mask_cfg, progress_weights, mask_replace_layer):
 
     for layer in only_in:
         assert isinstance(model.module_list[int(layer)][0], MaskConv2d), "Not a pruned model!"
-        in_channels_mask = model.module_list[int(layer)][0].selected_channels_mask
+        in_channels_mask = model.module_list[int(layer)][0].selected_channels_mask > 0.1
         in_channels = int(torch.sum(in_channels_mask))
 
         new_conv = nn.Conv2d(in_channels,
@@ -947,7 +947,7 @@ def prune(mask_cfg, progress_weights, mask_replace_layer):
              'training_results': None,
              'model': model.state_dict(),
              'optimizer': None}
-    torch.save(chkpt, '../weights/pruned-converted.pt')
+    torch.save(chkpt, '../weights/DCP/pruned-converted-voc.pt')
 
 
 if __name__ == '__main__':
