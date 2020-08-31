@@ -1,37 +1,30 @@
-import torch.nn as nn
-import torch
-from torchvision.ops import roi_align
-import torch.optim.lr_scheduler as lr_scheduler
-import torch.optim as optim
-import torch.distributed as dist
-
-import traceback
 import argparse
-from tqdm import tqdm
-import math
 import os.path as path
 import os
+import math
+from tqdm import tqdm
+import numpy as np
 import time
-import logging
+import traceback
+from collections import OrderedDict
+
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
 
 import test
 from models import Darknet
-from email_error import send_error_report
-from utils.utils import compute_loss, init_seeds
-from utils.parse_config import parse_data_cfg
+from model_unit import MaskConv2d
 from utils.datasets import LoadImagesAndLabels
+from utils.utils import compute_loss, init_seeds
 from utils.torch_utils import select_device
-from aux_net import mask_cfg_and_converted, AuxNetUtils, HookUtils, compute_loss_for_LCP, train_aux_for_LCP, prune
-
-aux_weight = "../weights/LCP/aux.pt"  # weight for aux net
-aux_trained = path.exists(aux_weight)
-progress_chkpt = "../weights/LCP/pruning.pt"
-progress_result = "./LCP/pruning_progress.txt"
-last = "../weights/LCP/last.pt"
-loss_analyse = "./LCP/loss_analyse.txt"
-
-logging.basicConfig(filename=loss_analyse, filemode='a', format='%(asctime)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger()
+from utils.parse_config import parse_data_cfg, parse_model_cfg
+from aux_net import AuxNetUtils, HookUtils, mask_cfg_and_converted, compute_loss_for_MFCP, train_aux_for_MFCP, \
+    write_cfg, prune
+import logging
+from email_error import send_error_report
 
 hyp = {'diou': 3.5,  # giou loss gain
        'giou': 3.5,
@@ -40,11 +33,11 @@ hyp = {'diou': 3.5,  # giou loss gain
        'obj': 49.5,  # obj loss gain (*=img_size/320 if img_size != 320)
        'obj_pw': 1.0,  # obj BCELoss positive_weight
        'iou_t': 0.225,  # iou training threshold
-       'lr0': 0.001,  # initial learning rate (SGD=1E-3, Adam=9E-5)
+       'lr0': 0.005,  # initial learning rate (SGD=1E-3, Adam=9E-5)
        'lrf': -4.,  # final LambdaLR learning rate = lr0 * (10 ** lrf)
        'momentum': 0.9,  # SGD momentum
        'weight_decay': 0.0005,  # optimizer weight decay
-       'joint_loss': 1.0,
+       'joint_loss': 1,
        'fl_gamma': 0.5,  # focal loss gamma
        'hsv_h': 0.0138,  # image HSV-Hue augmentation (fraction)
        'hsv_s': 0.678,  # image HSV-Saturation augmentation (fraction)
@@ -53,6 +46,15 @@ hyp = {'diou': 3.5,  # giou loss gain
        'translate': 0.05,  # image translation (+/- fraction)
        'scale': 0.05,  # image scale (+/- gain)
        'shear': 0.641}  # image shear (+/- deg)
+
+aux_weight = "../weights/aux.pt"  # weight for aux net
+aux_trained = path.exists(aux_weight)
+progress_chkpt = "../weights/pruning.pt"
+progress_result = "./pruning_progress.txt"
+last = "../weights/last.pt"
+loss_analyse = 'loss_analyse.txt'
+logging.basicConfig(filename=loss_analyse, filemode='a', format='%(asctime)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger()
 
 
 def fine_tune(prune_cfg, data, aux_util, device, train_loader, test_loader, epochs=10):
@@ -72,11 +74,14 @@ def fine_tune(prune_cfg, data, aux_util, device, train_loader, test_loader, epoc
 
     current_layer = chkpt['current_layer']
     aux_in_layer = aux_util.conv_layer_dict[current_layer]
-    aux_model = aux_util.creat_aux_model(aux_in_layer)
+    aux_model = aux_util.creat_aux_model(aux_in_layer, img_size)
     aux_model.to(device)
-
-    aux_model.load_state_dict(chkpt['aux_in{}'.format(aux_in_layer)], strict=True)
-    aux_loss_scalar = max(0.01, pow((int(aux_in_layer) + 1) / 75, 2))
+    try:
+        aux_model.load_state_dict(chkpt['aux_in{}'.format(aux_in_layer)], strict=True)
+        aux_loss_scalar = max(0.01, pow((int(aux_in_layer) + 1) / 75, 2))
+    except KeyError:
+        aux_model.load_state_dict(chkpt['aux_in{}'.format(aux_in_layer[0])], strict=True)
+        aux_loss_scalar = max(0.01, pow((int(aux_in_layer[0]) + 1) / 75, 2))
 
     start_epoch = chkpt['epoch'] + 1
 
@@ -90,9 +95,11 @@ def fine_tune(prune_cfg, data, aux_util, device, train_loader, test_loader, epoc
         else:
             pg0 += [v]  # parameter group 0
 
-    for v in aux_model.parameters():
-        pg0 += [v]  # parameter group 0
-
+    for k, v in dict(aux_model.named_parameters()).items():
+        if 'Conv2d.weight' in k:
+            pg1 += [v]  # parameter group 1 (apply weight_decay)
+        else:
+            pg0 += [v]  # parameter group 0
     optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
     optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
     del pg0, pg1
@@ -108,6 +115,7 @@ def fine_tune(prune_cfg, data, aux_util, device, train_loader, test_loader, epoc
     if device.type != 'cpu' and torch.cuda.device_count() > 1:
         pruned_model = nn.parallel.DistributedDataParallel(pruned_model, find_unused_parameters=True)
         pruned_model.yolo_layers = pruned_model.module.yolo_layers
+        aux_model = nn.parallel.DistributedDataParallel(aux_model, find_unused_parameters=True)
 
     # -------------start train-------------
     nb = len(train_loader)
@@ -117,9 +125,12 @@ def fine_tune(prune_cfg, data, aux_util, device, train_loader, test_loader, epoc
     for epoch in range(start_epoch, epochs):
 
         # -------------register hook for model-------------
+        handles = []
         for name, child in pruned_model.module.module_list.named_children():
-            if name == aux_in_layer:
-                handle = child.register_forward_hook(hook_util.hook_prune_output)
+            if isinstance(aux_in_layer, str) and name == aux_in_layer:
+                handles.append(child.register_forward_hook(hook_util.hook_prune_output))
+            elif isinstance(aux_in_layer, list) and name in aux_in_layer:
+                handles.append(child.register_forward_hook(hook_util.hook_prune_output))
 
         # -------------register hook for model-------------
 
@@ -145,9 +156,12 @@ def fine_tune(prune_cfg, data, aux_util, device, train_loader, test_loader, epoc
 
             hook_util.cat_to_gpu0()
 
-            aux_pred, loc_loss = aux_model(hook_util.prune_features['gpu0'][0], targets, pruned_pred)
+            if isinstance(aux_in_layer, str):
+                aux_pred = aux_model(hook_util.prune_features['gpu0'][0])
+            else:
+                aux_pred = aux_model(hook_util.prune_features['gpu0'][0], hook_util.prune_features['gpu0'][1])
 
-            aux_loss = compute_loss_for_LCP(aux_pred, loc_loss, targets)
+            aux_loss, aux_loss_items = compute_loss_for_MFCP(aux_pred, targets, aux_model)
             aux_loss *= aux_loss_scalar * batch_size / 64
 
             loss = pruned_loss + aux_loss
@@ -158,8 +172,11 @@ def fine_tune(prune_cfg, data, aux_util, device, train_loader, test_loader, epoc
                 optimizer.step()
                 optimizer.zero_grad()
 
-            pruned_loss_items[0] += loc_loss.item()
-            pruned_loss_items[2] += aux_loss.item()
+            pruned_loss_items[0] += aux_loss_items[0]
+            pruned_loss_items[1] *= 2
+            pruned_loss_items[2] += aux_loss_items[1]
+            pruned_loss_items[3] += aux_loss_items[2]
+            pruned_loss_items /= 2
             mloss = (mloss * i + pruned_loss_items) / (i + 1)
             mem = torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0
             s = ('%10s' * 3 + '%10.3g' * 4) % (
@@ -168,7 +185,8 @@ def fine_tune(prune_cfg, data, aux_util, device, train_loader, test_loader, epoc
         # -------------end batch-------------
 
         scheduler.step()
-        handle.remove()
+        for handle in handles:
+            handle.remove()
 
         results, _ = test.test(prune_cfg,
                                data,
@@ -197,14 +215,19 @@ def fine_tune(prune_cfg, data, aux_util, device, train_loader, test_loader, epoc
         chkpt['model'] = pruned_model.module.state_dict() if type(
             pruned_model) is nn.parallel.DistributedDataParallel else pruned_model.state_dict()
         chkpt['optimizer'] = None if epoch == epochs - 1 else optimizer.state_dict()
-        chkpt['aux_in{}'.format(aux_in_layer)] = aux_model.state_dict()
+        if isinstance(aux_in_layer, str):
+            chkpt['aux_in{}'.format(aux_in_layer)] = aux_model.module.state_dict() if type(
+                aux_model) is nn.parallel.DistributedDataParallel else aux_model.state_dict()
+        else:
+            chkpt['aux_in{}'.format(aux_in_layer[0])] = aux_model.module.state_dict() if type(
+                aux_model) is nn.parallel.DistributedDataParallel else aux_model.state_dict()
 
         torch.save(chkpt, progress_chkpt)
 
         torch.save(chkpt, last)
 
         if epoch == epochs - 1:
-            torch.save(chkpt, '../weights/LCP/backup{}.pt'.format(current_layer))
+            torch.save(chkpt, '../weights/backup{}.pt'.format(current_layer))
 
         del chkpt
 
@@ -218,9 +241,9 @@ def fine_tune(prune_cfg, data, aux_util, device, train_loader, test_loader, epoc
 
 def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader, select_layer, pruned_rate):
     with open(progress_result, 'a') as f:
-        f.write(('\n' + '%10s' * 9 + '\n') %
-                ('Stage', 'Change', 'MSELoss', 'AuxLoss', 'Total', 'P', 'R', 'mAP@0.5', 'F1'))
-    logger.info(('%10s' * 6) % ('Stage', 'Channels', 'Batch', 'MSELoss', 'AuxLoss', 'Total'))
+        f.write(('\n' + '%10s' * 10 + '\n') %
+                ('Stage', 'Change', 'MSELoss', 'PdLoss', 'AuxLoss', 'Total', 'P', 'R', 'mAP@0.5', 'F1'))
+    logger.info(('%10s' * 7) % ('Stage', 'Channels', 'Batch', 'MSELoss', 'PdLoss', 'AuxLoss', 'Total'))
 
     batch_size = data_loader.batch_size
     img_size = data_loader.dataset.img_size
@@ -234,28 +257,38 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
     pruning_model.load_state_dict(chkpt['model'], strict=True)
 
     aux_in_layer = aux_util.conv_layer_dict[select_layer]
-    aux_model = aux_util.creat_aux_model(aux_in_layer)
+    aux_model = aux_util.creat_aux_model(aux_in_layer, img_size)
     aux_model.to(device)
-
-    aux_model.load_state_dict(chkpt['aux_in{}'.format(aux_in_layer)], strict=True)
-    aux_loss_scalar = max(0.01, pow((int(aux_in_layer) + 1) / 75, 2))
+    try:
+        aux_model.load_state_dict(chkpt['aux_in{}'.format(aux_in_layer)], strict=True)
+        aux_loss_scalar = max(0.01, pow((int(aux_in_layer) + 1) / 75, 2))
+    except KeyError:
+        aux_model.load_state_dict(chkpt['aux_in{}'.format(aux_in_layer[0])], strict=True)
+        aux_loss_scalar = max(0.01, pow((int(aux_in_layer[0]) + 1) / 75, 2))
 
     del chkpt
 
-    solve_sub_problem_optimizer = optim.SGD(pruning_model.module_list[int(aux_in_layer)].MaskConv2d.parameters(),
-                                            lr=hyp['lr0'],
-                                            momentum=hyp['momentum'])
+    if isinstance(aux_in_layer, str):
+        solve_sub_problem_optimizer = optim.SGD(pruning_model.module_list[int(aux_in_layer)].MaskConv2d.parameters(),
+                                                lr=hyp['lr0'],
+                                                momentum=hyp['momentum'])
+    else:
+        solve_sub_problem_optimizer = optim.SGD(pruning_model.module_list[int(aux_in_layer[0])].MaskConv2d.parameters(),
+                                                lr=hyp['lr0'],
+                                                momentum=hyp['momentum'])
+        solve_sub_problem_optimizer.add_param_group(
+            {'params': pruning_model.module_list[int(aux_in_layer[1])].MaskConv2d.parameters()})
 
     for name, child in origin_model.module_list.named_children():
-        if name == aux_in_layer:
+        if isinstance(aux_in_layer, str) and name == aux_in_layer:
             handles.append(child.register_forward_hook(hook_util.hook_origin_output))
-        if name == select_layer:
+        elif isinstance(aux_in_layer, list) and name in aux_in_layer:
             handles.append(child.register_forward_hook(hook_util.hook_origin_output))
 
     for name, child in pruning_model.module_list.named_children():
-        if name == aux_in_layer:
+        if isinstance(aux_in_layer, str) and name == aux_in_layer:
             handles.append(child.register_forward_hook(hook_util.hook_prune_output))
-        if name == select_layer:
+        elif isinstance(aux_in_layer, list) and name in aux_in_layer:
             handles.append(child.register_forward_hook(hook_util.hook_prune_output))
 
     if device.type != 'cpu' and torch.cuda.device_count() > 1:
@@ -263,21 +296,25 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
         origin_model.yolo_layers = origin_model.module.yolo_layers
         pruning_model = torch.nn.parallel.DistributedDataParallel(pruning_model, find_unused_parameters=True)
         pruning_model.yolo_layers = pruning_model.module.yolo_layers
+        aux_model = nn.parallel.DistributedDataParallel(aux_model, find_unused_parameters=True)
 
-    retain_channels_num = math.floor(aux_util.layer_info[select_layer]["in_channels"] * (1 - pruned_rate))
+    if isinstance(pruned_rate, float):
+        retain_channels_num = math.floor(aux_util.layer_info[select_layer]["in_channels"] * (1 - pruned_rate))
+    else:
+        retain_channels_num = aux_util.layer_info[select_layer]["in_channels"]
     pruning_model.nc = 80
     pruning_model.hyp = hyp
     pruning_model.arc = 'default'
     pruning_model.eval()
     aux_model.eval()
     MSE = nn.MSELoss(reduction='mean')
-    mloss = torch.zeros(3).to(device)
+    mloss = torch.zeros(4).to(device)
 
     for i_k in range(retain_channels_num):
 
         data_iter = iter(data_loader)
         pbar = tqdm(range(n_iter), total=n_iter)
-        print(('\n' + '%10s' * 6) % ('Stage', 'gpu_mem', 'channels', 'MSELoss', 'AuxLoss', 'Total'))
+        print(('\n' + '%10s' * 7) % ('Stage', 'gpu_mem', 'channels', 'MSELoss', 'PdLoss', 'AuxLoss', 'Total'))
         for i in pbar:
 
             imgs, targets, _, _ = data_iter.next()
@@ -296,19 +333,25 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
 
             hook_util.cat_to_gpu0()
             mse_loss = torch.zeros(1, device=device)
+            if isinstance(aux_in_layer, str):
+                aux_pred = aux_model(hook_util.prune_features['gpu0'][0])
+                aux_loss, _ = compute_loss_for_MFCP(aux_pred, targets, aux_model)
+                mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
+            else:
+                aux_pred = aux_model(hook_util.prune_features['gpu0'][0], hook_util.prune_features['gpu0'][1])
+                aux_loss, _ = compute_loss_for_MFCP(aux_pred, targets, aux_model)
+                mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0]) + MSE(
+                    hook_util.prune_features['gpu0'][1], hook_util.origin_features['gpu0'][1])
+                mse_loss /= 2.0
 
-            aux_pred, loc_loss = aux_model(hook_util.prune_features['gpu0'][1], targets, pruning_pred)
-            aux_loss = compute_loss_for_LCP(aux_pred, loc_loss, targets)
-            mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
-
-            loss = hyp['joint_loss'] * mse_loss + aux_loss + pruning_loss
+            loss = hyp['joint_loss'] * mse_loss + 0 * pruning_loss + aux_loss
 
             loss.backward()
 
             mem = torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0
-            s = ('%10s' * 3 + '%10.3g' * 3) % (
-                'Prune ' + select_layer, '%.3gG' % mem, '%g/%g' % (i_k, retain_channels_num),
-                hyp['joint_loss'] * mse_loss, aux_loss, loss)
+            s = ('%10s' * 3 + '%10.3g' * 4) % (
+                'Prune ' + select_layer, '%.3gG' % mem, '%g/%g' % (i_k, retain_channels_num), mse_loss, pruning_loss,
+                aux_loss, loss)
             pbar.set_description(s)
 
             hook_util.clean_hook_out()
@@ -318,8 +361,8 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
 
         if i_k == 0:
             pruning_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask[:] = 1e-5
-            if select_layer in aux_util.sync_guide.keys():
-                sync_layer = aux_util.sync_guide[select_layer]
+            if isinstance(aux_in_layer, list) and select_layer in aux_in_layer:
+                sync_layer = aux_in_layer[1]
                 pruning_model.module.module_list[int(sync_layer)].MaskConv2d.selected_channels_mask[
                 (-1 * aux_util.layer_info[select_layer]["in_channels"]):] = 1e-5
 
@@ -327,14 +370,14 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
         _, indices = torch.topk(grad * (1 - selected_channels_mask), 1)
 
         pruning_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask[indices] = 1
-        if select_layer in aux_util.sync_guide.keys():
+        if isinstance(aux_in_layer, list) and select_layer in aux_in_layer:
             pruning_model.module.module_list[int(sync_layer)].MaskConv2d.selected_channels_mask[
                 -(aux_util.layer_info[select_layer]["in_channels"] - indices)] = 1
 
         pruning_model.zero_grad()
 
         pbar = tqdm(range(n_iter), total=n_iter)
-        print(('\n' + '%10s' * 6) % ('Stage', 'gpu_mem', 'channels', 'MSELoss', 'AuxLoss', 'Total'))
+        print(('\n' + '%10s' * 7) % ('Stage', 'gpu_mem', 'channels', 'MSELoss', 'PdLoss', 'AuxLoss', 'Total'))
         for i in pbar:
 
             imgs, targets, _, _ = data_iter.next()
@@ -353,12 +396,18 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
 
             hook_util.cat_to_gpu0()
             mse_loss = torch.zeros(1, device=device)
+            if isinstance(aux_in_layer, str):
+                aux_pred = aux_model(hook_util.prune_features['gpu0'][0])
+                aux_loss, _ = compute_loss_for_MFCP(aux_pred, targets, aux_model)
+                mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
+            else:
+                aux_pred = aux_model(hook_util.prune_features['gpu0'][0], hook_util.prune_features['gpu0'][1])
+                aux_loss, _ = compute_loss_for_MFCP(aux_pred, targets, aux_model)
+                mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0]) + MSE(
+                    hook_util.prune_features['gpu0'][1], hook_util.origin_features['gpu0'][1])
+                mse_loss /= 2.0
 
-            aux_pred, loc_loss = aux_model(hook_util.prune_features['gpu0'][1], targets, pruning_pred)
-            aux_loss = compute_loss_for_LCP(aux_pred, loc_loss, targets)
-            mse_loss += MSE(hook_util.prune_features['gpu0'][0], hook_util.origin_features['gpu0'][0])
-
-            loss = hyp['joint_loss'] * mse_loss + aux_loss_scalar * aux_loss + pruning_loss
+            loss = hyp['joint_loss'] * mse_loss + 0 * pruning_loss + aux_loss_scalar * aux_loss
 
             loss.backward()
 
@@ -367,22 +416,26 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
                 solve_sub_problem_optimizer.zero_grad()
 
             mem = torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0
-            mloss = (mloss * i + torch.cat([hyp['joint_loss'] * mse_loss, aux_loss, loss]).detach()) / (i + 1)
-            s = ('%10s' * 3 + '%10.3g' * 3) % (
+            mloss = (mloss * i + torch.cat([mse_loss, pruning_loss, aux_loss, loss]).detach()) / (i + 1)
+            s = ('%10s' * 3 + '%10.3g' * 4) % (
                 'SubProm ' + select_layer, '%.3gG' % mem, '%g/%g' % (i_k, retain_channels_num), *mloss)
             pbar.set_description(s)
 
-            if (i + 1) % 5 == 0:
-                logger.info(('%10s' * 3 + '%10.3g' * 3) %
-                            ('SubPro' + select_layer, str(i_k), '%g/%g' % (i, n_iter), *mloss))
+            if (i + 1) % n_iter == 0:
+                logger.info(('%10s' * 3 + '%10.3g' * 4) %
+                            ('SubPro' + select_layer, str(i_k), '%g/%g' % (i, n_iter), mse_loss, pruning_loss, aux_loss,
+                             loss))
 
             hook_util.clean_hook_out()
+
+        solve_sub_problem_optimizer.step()
+        solve_sub_problem_optimizer.zero_grad()
 
     for handle in handles:
         handle.remove()
 
-    greedy_indices = pruning_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask < 1
-    pruning_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask[greedy_indices] = 0
+    remove_indices = pruning_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask < 1
+    pruning_model.module.module_list[int(select_layer)].MaskConv2d.selected_channels_mask[remove_indices] = 0
 
     res, _ = test.test(prune_cfg,
                        data,
@@ -407,9 +460,9 @@ def channels_select(prune_cfg, data, origin_model, aux_util, device, data_loader
     del chkpt
 
     with open(progress_result, 'a') as f:
-        f.write(('%10s' * 2 + '%10.3g' * 7) %
+        f.write(('%10s' * 2 + '%10.3g' * 8) %
                 ('Pruning ' + select_layer,
-                 str(aux_util.layer_info[select_layer]['in_channels']) + '->' + str(retain_channels_num), *mloss,
+                 str(aux_util.layer_info[select_layer]["in_channels"]) + '->' + str(retain_channels_num), *mloss,
                  *res[:4]) + '\n')
 
     torch.cuda.empty_cache()
@@ -456,20 +509,20 @@ def get_thin_model(cfg, backbone, neck, data, origin_weights, img_size, batch_si
         aux_chkpt = torch.load(aux_weight)
         if aux_chkpt["epoch"] + 1 != aux_epochs:
             del aux_chkpt
-            train_aux_for_LCP(cfg, backbone, neck, train_loader, origin_weights, aux_weight, hyp, device, resume=True,
-                              epochs=aux_epochs)
+            train_aux_for_MFCP(cfg, backbone, neck, train_loader, origin_weights, aux_weight, hyp, device, resume=True,
+                               epochs=aux_epochs)
         else:
             del aux_chkpt
     else:
-        train_aux_for_LCP(cfg, backbone, neck, train_loader, origin_weights, aux_weight, hyp, device, resume=False,
-                          epochs=aux_epochs)
+        train_aux_for_MFCP(cfg, backbone, neck, train_loader, origin_weights, aux_weight, hyp, device, resume=False,
+                           epochs=aux_epochs)
     # -----------get trained aux net-----------
 
     # ----------init model and aux util----------
     origin_model = Darknet(cfg).to(device)
     chkpt = torch.load(origin_weights, map_location=device)
     origin_model.load_state_dict(chkpt['model'], strict=True)
-    aux_util = AuxNetUtils(origin_model, hyp, backbone, neck, strategy="LCP")
+    aux_util = AuxNetUtils(origin_model, hyp, prune_short=False, backbone=backbone, neck=neck)
     del chkpt
     # ----------init model and aux net----------
 
@@ -509,13 +562,13 @@ if __name__ == '__main__':
     parser.add_argument('--prune-rate', type=float, default=0.5)
     parser.add_argument('--start_layer', type=str, default='1')
     parser.add_argument('--aux-epochs', type=int, default=50)
-    parser.add_argument('--ft-epochs', type=int, default=15)
-    parser.add_argument('--batch-size', type=int, default=32)  # effective bs = batch_size * accumulate = 16 * 4 = 64
-    parser.add_argument('--cfg', type=str, default='cfg/yolov3-voc.cfg', help='*.cfg path')
+    parser.add_argument('--ft-epochs', type=int, default=3)
+    parser.add_argument('--batch-size', type=int, default=16)  # effective bs = batch_size * accumulate = 16 * 4 = 64
+    parser.add_argument('--cfg', type=str, default='cfg/yolov3.cfg', help='*.cfg path')
     parser.add_argument('--backbone', type=str, default='DarkNet53')
     parser.add_argument('--neck', type=str, default='FPN')
-    parser.add_argument('--weights', type=str, default='../weights/converted-voc.pt', help='initial weights')
-    parser.add_argument('--data', type=str, default='data/voc.data', help='*.data path')
+    parser.add_argument('--weights', type=str, default='../weights/converted.pt', help='initial weights')
+    parser.add_argument('--data', type=str, default='data/coco2014.data', help='*.data path')
     parser.add_argument('--img-size', type=int, default=416, help='inference size (pixels)')
     parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1 or cpu)')
     parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')
@@ -532,9 +585,9 @@ if __name__ == '__main__':
 
     try:
         mask_cfg, aux_util = get_thin_model(cfg=opt.cfg,
-                                            data=opt.data,
                                             backbone=opt.backbone,
                                             neck=opt.neck,
+                                            data=opt.data,
                                             origin_weights=opt.weights,
                                             img_size=opt.img_size,
                                             batch_size=opt.batch_size,
@@ -549,5 +602,5 @@ if __name__ == '__main__':
 
     dist.destroy_process_group() if torch.cuda.device_count() > 1 else None
 
-    prune(mask_cfg, progress_chkpt, aux_util.mask_replace_layer, 'cfg/pruned-yolov3-voc.cfg',
-          '../weights/LCP/pruned-converted-voc.pt')
+    prune(mask_cfg, progress_chkpt, aux_util.mask_replace_layer, 'cfg/pruned-yolov3.cfg',
+          '../weights/pruned-converted.pt')

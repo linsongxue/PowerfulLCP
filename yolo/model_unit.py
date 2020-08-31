@@ -152,3 +152,29 @@ class MaskBatchNorm2d(nn.BatchNorm2d):
             input, self.running_mean, self.running_var, self.weight.data.mul(mask), self.bias.data.mul(mask),
             self.training or not self.track_running_stats,
             exponential_average_factor, self.eps)
+
+
+class DownSample(nn.Module):
+    __constants__ = ['size', 'scale_factor', 'mode', 'align_corners']
+
+    def __init__(self, size=None, scale_factor=None, mode='nearest', align_corners=None):
+        super(DownSample, self).__init__()
+
+        self.size = size
+        if isinstance(scale_factor, tuple):
+            self.scale_factor = tuple(float(factor) for factor in scale_factor)
+        else:
+            self.scale_factor = float(scale_factor) if scale_factor else None
+        self.mode = mode
+        self.align_corners = align_corners
+
+    def forward(self, input):
+        return F.interpolate(input, self.size, self.scale_factor, self.mode, self.align_corners)
+
+    def extra_repr(self):
+        if self.scale_factor is not None:
+            info = 'scale_factor=' + str(self.scale_factor)
+        else:
+            info = 'size=' + str(self.size)
+        info += ', mode=' + self.mode
+        return info

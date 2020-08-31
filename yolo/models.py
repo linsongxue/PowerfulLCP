@@ -87,6 +87,9 @@ def create_modules(module_defs, img_size, arc):
         elif mdef['type'] == 'upsample':
             modules = nn.Upsample(scale_factor=int(mdef['stride']), mode='nearest')
 
+        elif mdef['type'] == 'downsample':
+            modules = DownSample(scale_factor=1 / float(mdef['stride']), mode='nearest')
+
         elif mdef['type'] == 'route':  # nn.Sequential() placeholder for 'route' layer
             layers = [int(x) for x in mdef['layers'].split(',')]
             filters = sum([output_filters[i + 1 if i > 0 else i] for i in layers])
@@ -265,7 +268,8 @@ class Darknet(nn.Module):
 
         for i, (mdef, module) in enumerate(zip(self.module_defs, self.module_list)):
             mtype = mdef['type']
-            if mtype in ['convolutional', 'upsample', 'maxpool', 'cbamconvolutional', 'maskconvolutional']:
+            if mtype in ['convolutional', 'upsample', 'maxpool', 'cbamconvolutional', 'maskconvolutional',
+                         'downsample']:
                 x = module(x)
             elif mtype == 'route':
                 layers = [int(x) for x in mdef['layers'].split(',')]
@@ -471,4 +475,3 @@ def attempt_download(weights):
         if not (r == 0 and os.path.exists(weights) and os.path.getsize(weights) > 1E6):  # weights exist and > 1MB
             os.system('rm ' + weights)  # remove partial downloads
             raise Exception(msg)
-
